@@ -493,6 +493,47 @@ def test_toolsets_for_source_safe_default_when_unset(monkeypatch):
     assert _adapter().toolsets_for_source(None) == [*adapter_mod.SAFE_DEFAULT_TOOLSETS, "no_mcp"]
 
 
+# ── Opt-in unrestricted_toolsets: operator list passes through unfiltered ──
+
+
+def test_unrestricted_keeps_dangerous_toolsets():
+    requested = ["linear_agent", "terminal", "file", "delegation", "hermes-cli", "terminal", "no_mcp"]
+    assert filter_linear_toolsets(requested, unrestricted=True) == [
+        "linear_agent",
+        "terminal",
+        "file",
+        "delegation",
+        "hermes-cli",
+        "no_mcp",
+    ]
+
+
+def test_unrestricted_still_ensures_linear_agent_and_no_mcp():
+    assert filter_linear_toolsets("terminal,web", unrestricted=True) == ["linear_agent", "terminal", "web", "no_mcp"]
+    assert filter_linear_toolsets(["terminal"], allow_mcp=True, unrestricted=True) == ["linear_agent", "terminal"]
+
+
+def test_unrestricted_unset_uses_safe_defaults():
+    assert filter_linear_toolsets(None, unrestricted=True) == [*adapter_mod.SAFE_DEFAULT_TOOLSETS, "no_mcp"]
+
+
+def test_unrestricted_option_read_from_extra_and_env(monkeypatch, caplog):
+    import hermes_cli.config as cfg
+
+    monkeypatch.setattr(cfg, "load_config", lambda: {"platform_toolsets": {"linear_agent": ["terminal", "web"]}})
+    monkeypatch.delenv("LINEAR_AGENT_UNRESTRICTED_TOOLSETS", raising=False)
+    assert _adapter().toolsets_for_source(None) == ["linear_agent", "web", "no_mcp"]
+
+    with caplog.at_level(logging.WARNING, logger="hermes_linear_agent.adapter"):
+        adapter = _adapter(extra={"unrestricted_toolsets": True})
+    assert adapter.toolsets_for_source(None) == ["linear_agent", "terminal", "web", "no_mcp"]
+    warnings = [r for r in caplog.records if "unrestricted_toolsets is ON" in r.getMessage()]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+
+    monkeypatch.setenv("LINEAR_AGENT_UNRESTRICTED_TOOLSETS", "true")
+    assert _adapter().toolsets_for_source(None) == ["linear_agent", "terminal", "web", "no_mcp"]
+
+
 # ── Authorization: non-allowlisted senders get zero side effects ──
 
 

@@ -306,7 +306,7 @@ def _toolset_tools(name: str) -> set[str]:
         return set()
 
 
-def filter_linear_toolsets(requested: Any, *, allow_mcp: bool = False) -> list[str]:
+def filter_linear_toolsets(requested: Any, *, allow_mcp: bool = False, unrestricted: bool = False) -> list[str]:
     """Strip dangerous toolsets from a Linear platform toolset list (fail closed).
 
     ``requested`` is the operator's ``platform_toolsets.linear_agent`` value
@@ -314,6 +314,11 @@ def filter_linear_toolsets(requested: Any, *, allow_mcp: bool = False) -> list[s
     DENIED_TOOLSETS — or resolving to a DENIED_TOOLS tool — are removed.
     Unless ``allow_mcp`` is set, ``no_mcp`` is appended so globally enabled
     MCP servers (which may act as the human user) never reach Linear turns.
+
+    ``unrestricted`` (operator opt-in) skips the dangerous-toolset filter and
+    keeps the operator's list as-is. It never grants anything implicitly: an
+    unset list still yields SAFE_DEFAULT_TOOLSETS, ``linear_agent`` is still
+    ensured, and ``no_mcp`` is still appended unless ``allow_mcp``.
     """
     if isinstance(requested, str):
         names = [item.strip() for item in requested.split(",") if item.strip()]
@@ -326,7 +331,9 @@ def filter_linear_toolsets(requested: Any, *, allow_mcp: bool = False) -> list[s
     for name in dict.fromkeys(names):
         if name == "no_mcp":
             continue
-        if name.startswith("hermes-") or name in DENIED_TOOLSETS or (_toolset_tools(name) & DENIED_TOOLS):
+        if not unrestricted and (
+            name.startswith("hermes-") or name in DENIED_TOOLSETS or (_toolset_tools(name) & DENIED_TOOLS)
+        ):
             dropped.append(name)
             continue
         kept.append(name)
@@ -496,6 +503,7 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict[str, Any] | N
         "max_body_bytes",
         "profile_routes",
         "allow_mcp",
+        "unrestricted_toolsets",
         "toolsets",
     ):
         if key in platform_cfg:
@@ -591,6 +599,22 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # they commonly authenticate as the human (e.g. a personal Linear or
         # Telegram MCP), which would break app-only attribution.
         self._allow_mcp = _bool_opt(extra, "allow_mcp", "LINEAR_AGENT_ALLOW_MCP", False)
+        # Default OFF: disables the hard toolset guard so the operator's
+        # toolset list reaches Linear turns unfiltered. Linear content is
+        # untrusted input, so this is a deliberate, loudly logged opt-in.
+        self._unrestricted_toolsets = _bool_opt(
+            extra,
+            "unrestricted_toolsets",
+            "LINEAR_AGENT_UNRESTRICTED_TOOLSETS",
+            False,
+        )
+        if self._unrestricted_toolsets:
+            logger.warning(
+                "[linear_agent] unrestricted_toolsets is ON: the hard toolset guard is disabled, so "
+                "Linear-triggered turns may receive dangerous toolsets (terminal, file, code execution, "
+                "delegation, cronjob, browser, hermes-* composites, ...). Linear issue and comment "
+                "content is untrusted input and can steer these tools."
+            )
         self._configured_toolsets = extra.get("toolsets")
         self._access_token = _resolve_access_token(config.token, extra)
         self._webhook_secret = str(extra.get("webhook_secret") or _str_env("LINEAR_AGENT_WEBHOOK_SECRET") or "").strip()
@@ -685,7 +709,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         Replaces ``platform_toolsets.linear_agent`` (the gateway re-validates
         the result through its normal resolver). The operator's list is read
         from ``linear_agent.toolsets`` or ``platform_toolsets.linear_agent``;
-        dangerous toolsets are removed regardless of what it says.
+        dangerous toolsets are removed regardless of what it says, unless the
+        operator opted in to ``unrestricted_toolsets``.
         """
         requested = self._configured_toolsets
         if requested is None:
@@ -696,7 +721,11 @@ class LinearAgentAdapter(BasePlatformAdapter):
             except Exception:  # noqa: BLE001 - fall back to the safe default list
                 logger.debug("[linear_agent] Could not read platform_toolsets", exc_info=True)
                 requested = None
-        return filter_linear_toolsets(requested, allow_mcp=self._allow_mcp)
+        return filter_linear_toolsets(
+            requested,
+            allow_mcp=self._allow_mcp,
+            unrestricted=self._unrestricted_toolsets,
+        )
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not AIOHTTP_AVAILABLE:

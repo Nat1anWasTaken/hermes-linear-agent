@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented here.
 
+## Unreleased
+
+### Security
+
+- Opt-in `unrestricted_toolsets: true` (env `LINEAR_AGENT_UNRESTRICTED_TOOLSETS`, default off) disables the hard toolset guard so the operator's toolset list reaches Linear turns unfiltered, including `terminal`, `file`, `code_execution`, `delegation` and `hermes-*` composites. `linear_agent` is still ensured, `no_mcp` is still appended unless `allow_mcp: true`, and an unset list still yields the safe defaults. A warning is logged at adapter startup when enabled, since Linear content is untrusted input.
+
 ## 0.4.3 — 2026-11-09 (hardening fork)
 
 ### Security
