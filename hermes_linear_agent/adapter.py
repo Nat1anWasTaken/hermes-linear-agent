@@ -653,6 +653,13 @@ class LinearAgentAdapter(BasePlatformAdapter):
             False,
         )
         self._mutation_policy = _merge_policy(extra.get("mutation_policy"))
+        # Gateway operational notices (e.g. "No home channel is set") reach
+        # adapters through a plain send() with no interim marker, which would
+        # post them as a session-completing `response`. Default this platform
+        # to private notice delivery so they route through send_private_notice
+        # below and land as non-final `thought` activities instead.
+        if isinstance(config.extra, dict):
+            config.extra.setdefault("notice_delivery", "private")
         self._auto_skills = _list_value(extra.get("auto_skills"))
         self._max_body_bytes = int(extra.get("max_body_bytes") or 1_048_576)
         self._oauth_manager = _build_oauth_manager(extra, self._access_token)
@@ -917,6 +924,22 @@ class LinearAgentAdapter(BasePlatformAdapter):
             message_id=str(activity.get("id") or ""),
             raw_response={"agent_activity": activity, "source_comment": source_reply} if source_reply else activity,
         )
+
+    async def send_private_notice(
+        self,
+        chat_id: str,
+        user_id: str | None,
+        content: str,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Operational notices are never the turn's answer: post a `thought`."""
+        agent_session_id = str((metadata or {}).get("linear_agent_session_id") or chat_id or "").strip()
+        if not agent_session_id or self._issue_reply_target(agent_session_id):
+            return SendResult(success=False, error="No Linear Agent Session for a private notice")
+        if agent_session_id in self._stopped_sessions:
+            return SendResult(success=True, message_id="")
+        return await self._send_activity(agent_session_id, content, "thought")
 
     async def _send_activity(self, agent_session_id: str, content: str, response_type: str) -> SendResult:
         """Post non-final content as ``thought``/``elicitation`` activities."""
@@ -1264,6 +1287,19 @@ class LinearAgentAdapter(BasePlatformAdapter):
             logger.warning(
                 "[linear_agent] Source comment %s was not found for session %s",
                 context.source_comment_id,
+                context.agent_session_id,
+            )
+            return
+        if (
+            context.comment_id
+            and root_id in (context.comment_id, context.source_comment_id)
+            and (context.source_comment_id == context.comment_id or root_id == context.comment_id)
+        ):
+            # The source thread IS the session's own thread (e.g. delegation):
+            # Linear already mirrors responses there, so a second copy would
+            # duplicate every reply.
+            logger.debug(
+                "[linear_agent] Source thread is the session thread for %s; no mirror needed",
                 context.agent_session_id,
             )
             return

@@ -603,3 +603,55 @@ def test_describe_actor_fields_never_includes_values():
     fields = describe_actor_fields(_sdk_prompted(author="secret-user"))
     assert "agentActivity.userId" in fields and "agentSession.creatorId" in fields
     assert not any("secret-user" in f for f in fields)
+
+
+# ── Live findings: operational notices and self-thread mirror ──
+
+
+@pytest.mark.asyncio
+async def test_operational_notices_are_thoughts_and_keep_mirror():
+    client = _Client()
+    adapter = _adapter(
+        extra={"reply_in_source_thread": True, "mutation_policy": {"create_comments": True}}, client=client
+    )
+    assert adapter.config.extra["notice_delivery"] == "private"
+    adapter._source_thread_routes["session-1"] = ("issue-1", "root-1")
+    result = await adapter.send_private_notice("session-1", "user-1", "📬 No home channel is set")
+    assert result.success
+    assert client.calls == [("thought", "session-1", "📬 No home channel is set")]
+    assert "session-1" in adapter._source_thread_routes
+
+
+def test_explicit_notice_delivery_is_respected():
+    assert _adapter(extra={"notice_delivery": "public"}).config.extra["notice_delivery"] == "public"
+
+
+@pytest.mark.asyncio
+async def test_no_mirror_when_source_thread_is_session_thread():
+    class _SelfRootClient(_Client):
+        async def get_comment_thread_root_id(self, comment_id):
+            return comment_id
+
+    client = _SelfRootClient()
+    adapter = _adapter(
+        extra={"reply_in_source_thread": True, "mutation_policy": {"create_comments": True}}, client=client
+    )
+
+    async def capture(event):
+        return None
+
+    adapter.handle_message = capture
+    payload = _created(delivery="evt-self")
+    payload["agentSession"]["comment"]["id"] = "thread-root"
+    payload["agentSession"]["sourceCommentId"] = "thread-root"
+    raw = _raw(payload)
+    await adapter.handle_webhook(_headers(raw, "evt-self"), raw)
+    assert "session-1" not in adapter._source_thread_routes
+
+    # A mention from a DIFFERENT thread still gets mirrored.
+    payload = _created(delivery="evt-other")
+    payload["agentSession"]["comment"]["id"] = "session-copy-root"
+    payload["agentSession"]["sourceCommentId"] = "human-thread-root"
+    raw = _raw(payload)
+    await adapter.handle_webhook(_headers(raw, "evt-other"), raw)
+    assert adapter._source_thread_routes["session-1"] == ("issue-1", "human-thread-root")
