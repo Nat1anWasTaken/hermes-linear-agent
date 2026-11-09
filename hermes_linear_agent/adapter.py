@@ -1290,11 +1290,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 context.agent_session_id,
             )
             return
-        if (
-            context.comment_id
-            and root_id in (context.comment_id, context.source_comment_id)
-            and (context.source_comment_id == context.comment_id or root_id == context.comment_id)
-        ):
+        if context.comment_id and root_id == context.comment_id:
             # The source thread IS the session's own thread (e.g. delegation):
             # Linear already mirrors responses there, so a second copy would
             # duplicate every reply.
