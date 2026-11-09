@@ -206,6 +206,10 @@ class _ActiveMutationAdapter:
 
 
 def _body(payload):
+    # Real Linear deliveries always carry a signed webhookTimestamp (Unix ms);
+    # the adapter rejects bodies without one.
+    if isinstance(payload, dict) and "webhookTimestamp" not in payload:
+        payload = {**payload, "webhookTimestamp": int(time.time() * 1000)}
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 

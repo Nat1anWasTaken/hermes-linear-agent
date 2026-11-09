@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -52,6 +53,7 @@ from .webhook import (
     SUPPORTED_ACTIONS,
     LinearWebhookContext,
     LinearWebhookError,
+    body_timestamp_problem,
     build_created_prompt,
     build_prompted_message,
     build_update_prompt,
@@ -59,7 +61,6 @@ from .webhook import (
     describe_signature_headers,
     extract_context,
     is_authorized,
-    is_stale_body_timestamp,
     normalize_action,
     parse_json_body,
     verify_linear_signature,
@@ -785,8 +786,6 @@ class LinearAgentAdapter(BasePlatformAdapter):
         if client_id:
             return f"client:{client_id}"
         if self._access_token:
-            import hashlib
-
             return "token:" + hashlib.sha256(self._access_token.encode("utf-8")).hexdigest()[:16]
         return ""
 
@@ -1104,7 +1103,12 @@ class LinearAgentAdapter(BasePlatformAdapter):
         except LinearWebhookError as exc:
             return {"error": str(exc)}, 400
 
-        if is_stale_body_timestamp(payload, headers):
+        # Replay guard on the signed body only (headers are not signed).
+        ts_problem = body_timestamp_problem(payload)
+        if ts_problem == "missing":
+            logger.warning("[linear_agent] Rejecting webhook without a signed webhookTimestamp (replay guard)")
+            return {"error": "Missing webhook timestamp"}, 400
+        if ts_problem == "stale":
             logger.warning("[linear_agent] Rejecting stale webhook delivery (replay guard)")
             return {"error": "Stale webhook delivery"}, 400
 
@@ -1174,7 +1178,13 @@ class LinearAgentAdapter(BasePlatformAdapter):
             )
             return {"error": "Unauthorized Linear user or team"}, 403
 
-        if self._dedup.is_duplicate(context.delivery_id):
+        # Dedupe on the signed body as well as the (unsigned, attacker-
+        # controllable) delivery-id header, so re-sending the same body under
+        # a new header value within the freshness window is still caught.
+        body_key = "body:" + hashlib.sha256(raw_body).hexdigest()
+        header_dup = self._dedup.is_duplicate(context.delivery_id)
+        body_dup = self._dedup.is_duplicate(body_key)
+        if header_dup or body_dup:
             return {
                 "status": "duplicate",
                 "delivery_id": context.delivery_id,

@@ -66,6 +66,10 @@ def _adapter(extra=None, client=None):
 
 
 def _raw(payload):
+    import time
+
+    if "webhookTimestamp" not in payload:
+        payload = {**payload, "webhookTimestamp": int(time.time() * 1000)}
     return json.dumps(payload, separators=(",", ":")).encode()
 
 
@@ -655,3 +659,62 @@ async def test_no_mirror_when_source_thread_is_session_thread():
     raw = _raw(payload)
     await adapter.handle_webhook(_headers(raw, "evt-other"), raw)
     assert adapter._source_thread_routes["session-1"] == ("issue-1", "human-thread-root")
+
+
+# ── Replay: unsigned headers must not refresh or re-key a captured delivery ──
+
+
+def _signed_hex(raw):
+    return hmac.new(SECRET.encode(), raw, hashlib.sha256).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_captured_body_cannot_be_replayed_with_fresh_timestamp_header():
+    """Linear signs the BODY only. An attacker holding an old signed delivery
+    can add a fresh (unsigned) Linear-Timestamp header and a new delivery id;
+    the signed body's webhookTimestamp must still decide freshness."""
+    import time
+
+    adapter = _adapter()
+    dispatched = []
+
+    async def capture(event):
+        dispatched.append(event)
+
+    adapter.handle_message = capture
+    raw = _raw(_created(delivery="evt-captured", webhookTimestamp=int((time.time() - 3600) * 1000)))
+    headers = {
+        "Linear-Signature": _signed_hex(raw),
+        "Linear-Delivery": "attacker-chosen-id",
+        "Linear-Timestamp": str(int(time.time() * 1000)),
+    }
+    resp, status = await adapter.handle_webhook(headers, raw)
+    assert status in (400, 401), resp
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_fresh_replay_with_new_delivery_header_is_still_deduplicated():
+    """Within the freshness window, re-sending the same signed body under a
+    different (unsigned) delivery-id header must still be a duplicate."""
+    import time
+
+    adapter = _adapter()
+    dispatched = []
+
+    async def capture(event):
+        dispatched.append(event)
+
+    adapter.handle_message = capture
+    raw = _raw(_created(delivery="evt-same-body", webhookTimestamp=int(time.time() * 1000)))
+    for delivery in ("hdr-1", "hdr-2"):
+        await adapter.handle_webhook({"Linear-Signature": _signed_hex(raw), "Linear-Delivery": delivery}, raw)
+    assert len(dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_signed_body_without_webhook_timestamp_is_rejected():
+    adapter = _adapter()
+    raw = json.dumps(_created(delivery="evt-no-ts"), separators=(",", ":")).encode()
+    resp, status = await adapter.handle_webhook({"Linear-Signature": _signed_hex(raw), "Linear-Delivery": "x"}, raw)
+    assert status == 400 and "timestamp" in resp["error"].lower()

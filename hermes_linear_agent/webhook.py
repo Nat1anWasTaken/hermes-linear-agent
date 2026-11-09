@@ -232,29 +232,38 @@ def verify_linear_signature(
     return any(hmac.compare_digest(part, candidate) for part in parts for candidate in candidates)
 
 
-def is_stale_body_timestamp(
+def body_timestamp_problem(
     payload: Mapping[str, Any],
-    headers: Mapping[str, str],
     *,
     tolerance_seconds: int = 60,
-) -> bool:
-    """Replay guard for deliveries whose timestamp rides only in the body.
+) -> str | None:
+    """Replay guard based on the SIGNED body (fail closed).
 
-    Header freshness is enforced during signature verification; without a
-    timestamp header, the signed ``webhookTimestamp`` body field is the only
-    thing stopping a captured delivery from replaying after the dedup TTL.
+    Linear's signature covers only the raw body, so headers such as
+    ``Linear-Timestamp`` are attacker-controllable on a captured delivery.
+    Freshness is therefore always decided by the body's ``webhookTimestamp``
+    (Unix ms, or seconds for compatibility). Returns ``"missing"``,
+    ``"stale"``, or None when fresh.
     """
-    if _header(headers, *TIMESTAMP_HEADERS):
-        return False
     ts = payload.get("webhookTimestamp")
-    if not ts:
-        return False
+    if ts in (None, ""):
+        return "missing"
     try:
         ts_value = float(ts)
     except (TypeError, ValueError):
-        return False
+        return "missing"
     ts_seconds = ts_value / 1000 if ts_value > 10_000_000_000 else ts_value
-    return abs(time.time() - ts_seconds) > tolerance_seconds
+    return "stale" if abs(time.time() - ts_seconds) > tolerance_seconds else None
+
+
+def is_stale_body_timestamp(
+    payload: Mapping[str, Any],
+    headers: Mapping[str, str] | None = None,
+    *,
+    tolerance_seconds: int = 60,
+) -> bool:
+    """Back-compat wrapper: True unless the signed body timestamp is fresh."""
+    return body_timestamp_problem(payload, tolerance_seconds=tolerance_seconds) is not None
 
 
 def describe_signature_headers(headers: Mapping[str, str]) -> dict[str, Any]:
