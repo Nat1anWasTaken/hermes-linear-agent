@@ -362,19 +362,63 @@ def _generic_turn_error_text() -> str:
         return "Sorry, I encountered an error."
 
 
+def _split_progress_entries(text: str) -> list[str]:
+    """Split gateway progress text into one entry per tool call.
+
+    Most tools render one line; terminal renders a fenced code block, usually
+    preceded by a ``💻 terminal`` header line (dropped for back-to-back
+    commands). A fenced block and its header form ONE entry.
+    """
+    entries: list[str] = []
+    lines = str(text or "").splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        if line.strip().startswith("```"):
+            block = [line]
+            i += 1
+            while i < len(lines):
+                block.append(lines[i])
+                i += 1
+                if lines[i - 1].strip().startswith("```") and len(block) > 1:
+                    break
+            prev = entries[-1] if entries else ""
+            if prev and "```" not in prev and ": " not in prev and len(prev) <= 80:
+                entries[-1] = prev + "\n" + "\n".join(block)
+            else:
+                entries.append("\n".join(block))
+            continue
+        entries.append(line)
+        i += 1
+    return entries
+
+
 def _classify_unmarked_send(content: str) -> str:
-    """Classify a send that carries neither notify nor an interim marker."""
+    """Classify a send that carries neither notify nor an interim marker.
+
+    The gateway marks every turn-final reply notify=True, so an unmarked send
+    is never allowed to become a session-completing `response`.
+    """
     text = str(content or "").strip()
     if text == _generic_turn_error_text():
         return "error"
-    if text and "\n" not in text and len(text) <= _MAX_PROGRESS_LINE:
+    entries = _split_progress_entries(text)
+    if entries and all(len(entry) <= 2 * _MAX_PROGRESS_LINE for entry in entries):
         return "action"
-    return "response"
+    return "thought"
 
 
 def _parse_progress_line(line: str) -> tuple[str, str]:
-    """Split a gateway tool-progress line into Linear action/parameter fields."""
+    """Split one progress entry into Linear action/parameter fields."""
     text = line.strip()
+    if "```" in text:
+        head, _, rest = text.partition("```")
+        code = rest.rsplit("```", 1)[0].strip("\n")
+        parameter = " ⏎ ".join(part.strip() for part in code.splitlines() if part.strip())
+        return (head.strip() or "💻 terminal")[:120], parameter[:_MAX_PROGRESS_LINE]
     match = _PROGRESS_PREVIEW_RE.match(text)
     if match:
         action, parameter = match.group("head"), match.group("param")
@@ -956,7 +1000,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 return await self._send_activity(agent_session_id, content, "error")
             if kind == "action":
                 bubble_id = f"progress:{uuid.uuid4().hex}"
-                return await self._post_progress_lines(agent_session_id, bubble_id, content.splitlines(), 0)
+                return await self._post_progress_lines(agent_session_id, bubble_id, _split_progress_entries(content), 0)
+            return await self._send_activity(agent_session_id, content, "thought")
 
         activity: dict[str, Any] = {}
         chunks = _split_message(content, self.MAX_MESSAGE_LENGTH)
@@ -1038,13 +1083,12 @@ class LinearAgentAdapter(BasePlatformAdapter):
         if bubble is None:
             return SendResult(success=False, error="Not supported")
         session_id, posted = bubble
-        lines = [line for line in content.splitlines() if line.strip()]
-        return await self._post_progress_lines(session_id, str(message_id), lines, posted)
+        return await self._post_progress_lines(session_id, str(message_id), _split_progress_entries(content), posted)
 
     async def _post_progress_lines(
         self, agent_session_id: str, bubble_id: str, lines: list[str], already_posted: int
     ) -> SendResult:
-        lines = [line for line in lines if line.strip()]
+        lines = [line for line in lines if line.strip()]  # entries (one per tool call)
         posted = already_posted
         if agent_session_id not in self._stopped_sessions:
             for line in lines[already_posted:]:

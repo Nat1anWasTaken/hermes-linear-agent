@@ -833,15 +833,80 @@ async def test_unknown_bubble_edit_is_refused_and_stopped_sessions_get_no_action
 
 
 @pytest.mark.asyncio
-async def test_unmarked_turn_error_becomes_error_activity_and_multiline_stays_response():
+async def test_unmarked_sends_never_become_responses():
     client = _Client()
     adapter = _adapter(client=client)
     await adapter.send("session-1", "Sorry, I encountered an error.")
-    await adapter.send("session-1", "line one\nline two")
+    await adapter.send("session-1", "x" * 2000)
     assert client.calls == [
         ("error", "session-1", "Sorry, I encountered an error."),
-        ("response", "session-1", "line one\nline two"),
+        ("thought", "session-1", "x" * 2000),
     ]
+
+
+# Exact shapes observed live (NAT-8): terminal progress is a fenced block,
+# with the "💻 terminal" header dropped for back-to-back commands.
+_TERMINAL_FIRST = "💻 terminal\n```\ncd /opt/data/cache/scratch && ls -d d...\n```"
+_TERMINAL_NEXT = "```\ncd /opt/data/cache/scratch/dadaocheng...\n```"
+
+
+@pytest.mark.asyncio
+async def test_terminal_progress_blocks_become_actions_not_responses():
+    client = _Client()
+    adapter = _adapter(
+        extra={"reply_in_source_thread": True, "mutation_policy": {"create_comments": True}}, client=client
+    )
+    adapter._source_thread_routes["session-1"] = ("issue-1", "root-1")
+    first = await adapter.send("session-1", _TERMINAL_FIRST)
+    second = await adapter.send("session-1", _TERMINAL_NEXT)
+    assert first.success and second.success
+    assert client.calls == [
+        ("action", "session-1", "💻 terminal", "cd /opt/data/cache/scratch && ls -d d..."),
+        ("action", "session-1", "💻 terminal", "cd /opt/data/cache/scratch/dadaocheng..."),
+    ]
+    assert "session-1" in adapter._source_thread_routes  # mirror kept for the real answer
+
+
+@pytest.mark.asyncio
+async def test_edited_bubble_with_mixed_blocks_posts_one_action_per_tool():
+    client = _Client()
+    adapter = _adapter(client=client)
+    first = await adapter.send("session-1", _TERMINAL_FIRST)
+    combined = "\n".join([_TERMINAL_FIRST, _TERMINAL_NEXT, "📚 Reading skill claude-code"])
+    await adapter.edit_message("session-1", first.message_id, combined)
+    await adapter.edit_message("session-1", first.message_id, combined)  # no new entries
+    assert [c[2:] for c in client.calls] == [
+        ("💻 terminal", "cd /opt/data/cache/scratch && ls -d d..."),
+        ("💻 terminal", "cd /opt/data/cache/scratch/dadaocheng..."),
+        ("📚 Reading skill claude-code", ""),
+    ]
+
+
+def test_split_progress_entries_groups_header_and_fence():
+    from hermes_linear_agent.adapter import _split_progress_entries
+
+    text = '🔍 web_search: "q"\n' + _TERMINAL_FIRST + "\n" + _TERMINAL_NEXT
+    assert _split_progress_entries(text) == ['🔍 web_search: "q"', _TERMINAL_FIRST, _TERMINAL_NEXT]
+
+
+@pytest.mark.asyncio
+async def test_real_gateway_terminal_block_shape_is_an_action():
+    """Render the progress text with the gateway's own helper, not a hand-written copy."""
+    from gateway.run_turn_progress import GatewayTurnProgressMixin
+
+    class _Ctx:
+        last_was_terminal_block = [False]
+
+    class _Adapter:
+        supports_code_blocks = True
+
+    runner = GatewayTurnProgressMixin.__new__(GatewayTurnProgressMixin)
+    runner._ctx = _Ctx()
+    full, short = runner._progress_terminal_blocks(_Adapter(), "terminal", {"command": "ls -la /tmp"}, "💻")
+    client = _Client()
+    adapter = _adapter(client=client)
+    await adapter.send("session-1", short)
+    assert client.calls[0][0] == "action" and client.calls[0][3] == "ls -la /tmp"
 
 
 def test_diagnostic_warning_variants_are_hidden_on_linear():
