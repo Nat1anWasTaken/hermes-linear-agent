@@ -8,6 +8,10 @@ All notable changes to this project will be documented here.
 
 - Opt-in `unrestricted_toolsets: true` (env `LINEAR_AGENT_UNRESTRICTED_TOOLSETS`, default off) disables the hard toolset guard so the operator's toolset list reaches Linear turns unfiltered, including `terminal`, `file`, `code_execution`, `delegation` and `hermes-*` composites. `linear_agent` is still ensured, `no_mcp` is still appended unless `allow_mcp: true`, and an unset list still yields the safe defaults. A warning is logged at adapter startup when enabled, since Linear content is untrusted input.
 
+### Fixed
+
+- Messages Hermes sends on its own between turns (the post-turn "💾 Self-improvement review", background-process notices) are posted as visible `response` activities instead of being folded into the collapsed progress block. The adapter counts dispatched turns per session, closes one on each final reply or turn error, and resets on stop; a stale count self-heals once the gateway no longer runs or queues the session. These messages never consume the source-thread mirror.
+
 ## 0.4.3 — 2026-11-09 (hardening fork)
 
 ### Security

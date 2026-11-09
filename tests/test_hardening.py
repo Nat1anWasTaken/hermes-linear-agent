@@ -65,10 +65,15 @@ class _Client:
         return "root-1"
 
 
-def _adapter(extra=None, client=None):
+def _adapter(extra=None, client=None, *, turn_open=True):
+    """Adapter whose "session-1" is mid-turn by default (as when the gateway sends progress)."""
     merged = {"access_token": "tok", "webhook_secret": SECRET, "allow_all_users": True}
     merged.update(extra or {})
-    return LinearAgentAdapter(PlatformConfig(enabled=True, extra=merged), client=client or _Client())
+    adapter = LinearAgentAdapter(PlatformConfig(enabled=True, extra=merged), client=client or _Client())
+    if turn_open:
+        adapter._open_turn("session-1", "key-1")
+        adapter._active_sessions["key-1"] = asyncio.Event()
+    return adapter
 
 
 def _raw(payload):
@@ -833,15 +838,81 @@ async def test_unknown_bubble_edit_is_refused_and_stopped_sessions_get_no_action
 
 
 @pytest.mark.asyncio
-async def test_unmarked_turn_error_becomes_error_activity_and_multiline_stays_response():
+async def test_unmarked_sends_never_become_responses():
     client = _Client()
     adapter = _adapter(client=client)
-    await adapter.send("session-1", "Sorry, I encountered an error.")
-    await adapter.send("session-1", "line one\nline two")
+    await adapter.send("session-1", "x" * 2000)
+    await adapter.send("session-1", "Sorry, I encountered an error.")  # ends the turn
     assert client.calls == [
+        ("thought", "session-1", "x" * 2000),
         ("error", "session-1", "Sorry, I encountered an error."),
-        ("response", "session-1", "line one\nline two"),
     ]
+    assert "session-1" not in adapter._open_turns
+
+
+# Exact shapes observed live (NAT-8): terminal progress is a fenced block,
+# with the "💻 terminal" header dropped for back-to-back commands.
+_TERMINAL_FIRST = "💻 terminal\n```\ncd /opt/data/cache/scratch && ls -d d...\n```"
+_TERMINAL_NEXT = "```\ncd /opt/data/cache/scratch/dadaocheng...\n```"
+
+
+@pytest.mark.asyncio
+async def test_terminal_progress_blocks_become_actions_not_responses():
+    client = _Client()
+    adapter = _adapter(
+        extra={"reply_in_source_thread": True, "mutation_policy": {"create_comments": True}}, client=client
+    )
+    adapter._source_thread_routes["session-1"] = ("issue-1", "root-1")
+    first = await adapter.send("session-1", _TERMINAL_FIRST)
+    second = await adapter.send("session-1", _TERMINAL_NEXT)
+    assert first.success and second.success
+    assert client.calls == [
+        ("action", "session-1", "💻 terminal", "cd /opt/data/cache/scratch && ls -d d..."),
+        ("action", "session-1", "💻 terminal", "cd /opt/data/cache/scratch/dadaocheng..."),
+    ]
+    assert "session-1" in adapter._source_thread_routes  # mirror kept for the real answer
+
+
+@pytest.mark.asyncio
+async def test_edited_bubble_with_mixed_blocks_posts_one_action_per_tool():
+    client = _Client()
+    adapter = _adapter(client=client)
+    first = await adapter.send("session-1", _TERMINAL_FIRST)
+    combined = "\n".join([_TERMINAL_FIRST, _TERMINAL_NEXT, "📚 Reading skill claude-code"])
+    await adapter.edit_message("session-1", first.message_id, combined)
+    await adapter.edit_message("session-1", first.message_id, combined)  # no new entries
+    assert [c[2:] for c in client.calls] == [
+        ("💻 terminal", "cd /opt/data/cache/scratch && ls -d d..."),
+        ("💻 terminal", "cd /opt/data/cache/scratch/dadaocheng..."),
+        ("📚 Reading skill claude-code", ""),
+    ]
+
+
+def test_split_progress_entries_groups_header_and_fence():
+    from hermes_linear_agent.adapter import _split_progress_entries
+
+    text = '🔍 web_search: "q"\n' + _TERMINAL_FIRST + "\n" + _TERMINAL_NEXT
+    assert _split_progress_entries(text) == ['🔍 web_search: "q"', _TERMINAL_FIRST, _TERMINAL_NEXT]
+
+
+@pytest.mark.asyncio
+async def test_real_gateway_terminal_block_shape_is_an_action():
+    """Render the progress text with the gateway's own helper, not a hand-written copy."""
+    from gateway.run_turn_progress import GatewayTurnProgressMixin
+
+    class _Ctx:
+        last_was_terminal_block = [False]
+
+    class _Adapter:
+        supports_code_blocks = True
+
+    runner = GatewayTurnProgressMixin.__new__(GatewayTurnProgressMixin)
+    runner._ctx = _Ctx()
+    full, short = runner._progress_terminal_blocks(_Adapter(), "terminal", {"command": "ls -la /tmp"}, "💻")
+    client = _Client()
+    adapter = _adapter(client=client)
+    await adapter.send("session-1", short)
+    assert client.calls[0][0] == "action" and client.calls[0][3] == "ls -la /tmp"
 
 
 def test_diagnostic_warning_variants_are_hidden_on_linear():
@@ -884,3 +955,89 @@ async def test_create_action_payload_shape():
         "agentSessionId": "s-1",
         "content": {"type": "action", "action": "🔍 web_search", "parameter": "kiwi"},
     }
+
+
+# --- proactive (between-turn) messages -------------------------------------
+
+_REVIEW = (
+    "💾 Self-improvement review: Skill 'sitcon-2027-preparation' patched "
+    "(references/meetings-and-calendar.md) · Skill 'google-workspace' patched"
+)
+
+
+@pytest.mark.asyncio
+async def test_post_turn_review_summary_is_a_visible_response_not_progress():
+    """Live shape: the gateway releases the review after the final reply, marked _interim_send."""
+    client = _Client()
+    adapter = _adapter(
+        extra={"reply_in_source_thread": True, "mutation_policy": {"create_comments": True}}, client=client
+    )
+    adapter._source_thread_routes["session-1"] = ("issue-1", "root-1")
+    await adapter.send("session-1", "The answer.", metadata=FINAL)
+    # Guard still held: the post-delivery hook fires before the gateway releases it.
+    await adapter.send("session-1", _REVIEW, metadata={"_interim_send": True})
+    assert client.calls[-1] == ("response", "session-1", _REVIEW)
+    # Only the real answer was mirrored to the source thread.
+    assert [c for c in client.calls if c[0] == "comment"] == [("comment", "issue-1", "The answer.", "root-1")]
+
+
+@pytest.mark.asyncio
+async def test_unmarked_send_between_turns_is_a_response_even_if_short():
+    client = _Client()
+    adapter = _adapter(client=client, turn_open=False)
+    note = "[Background process proc_1 finished with exit code 0]"
+    await adapter.send("session-1", note)
+    assert client.calls == [("response", "session-1", note)]
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_turn_keeps_progress_as_actions():
+    client = _Client()
+    adapter = _adapter(client=client)
+    adapter._open_turn("session-1", "key-1")  # follow-up queued during turn 1
+    await adapter.send("session-1", "Turn one.", metadata=FINAL)
+    await adapter.send("session-1", '🔍 web_search: "q"')
+    assert client.calls[-1] == ("action", "session-1", "🔍 web_search", "q")
+    await adapter.send("session-1", "Turn two.", metadata=FINAL)
+    await adapter.send("session-1", _REVIEW, metadata={"_interim_send": True})
+    assert client.calls[-1][0] == "response"
+
+
+@pytest.mark.asyncio
+async def test_stale_open_turn_self_heals_once_gateway_is_idle(monkeypatch):
+    """Merged follow-ups leave the count high; the gateway guard settles it."""
+    client = _Client()
+    adapter = _adapter(client=client)
+    adapter._open_turn("session-1", "key-1")  # merged into the same turn
+    await adapter.send("session-1", "Answer.", metadata=FINAL)
+    # Still within the registration grace: treated as mid-turn.
+    adapter._active_sessions.pop("key-1")
+    await adapter.send("session-1", "status", metadata={"_interim_send": True})
+    assert client.calls[-1][0] == "thought"
+    adapter.TURN_REGISTRATION_GRACE = -1.0
+    await adapter.send("session-1", _REVIEW, metadata={"_interim_send": True})
+    assert client.calls[-1] == ("response", "session-1", _REVIEW)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_opens_a_turn_and_stop_closes_it():
+    client = _Client()
+    adapter = _adapter(client=client, turn_open=False)
+    seen = []
+
+    async def _handle(event):
+        seen.append(event)
+
+    async def no_interrupt(session_key, chat_id):
+        return None
+
+    adapter.handle_message = _handle
+    adapter.interrupt_session_activity = no_interrupt
+    raw = _raw(_prompted(delivery="evt-turn"))
+    _, status = await adapter.handle_webhook(_headers(raw, "evt-turn"), raw)
+    await asyncio.sleep(0)
+    assert status == 200 and seen
+    assert adapter._open_turns["session-1"][0] == 1
+    raw = _raw(_prompted(delivery="evt-stop", body="stop", signal="stop"))
+    await adapter.handle_webhook(_headers(raw, "evt-stop"), raw)
+    assert "session-1" not in adapter._open_turns

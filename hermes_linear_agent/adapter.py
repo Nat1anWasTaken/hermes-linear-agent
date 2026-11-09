@@ -362,19 +362,63 @@ def _generic_turn_error_text() -> str:
         return "Sorry, I encountered an error."
 
 
+def _split_progress_entries(text: str) -> list[str]:
+    """Split gateway progress text into one entry per tool call.
+
+    Most tools render one line; terminal renders a fenced code block, usually
+    preceded by a ``💻 terminal`` header line (dropped for back-to-back
+    commands). A fenced block and its header form ONE entry.
+    """
+    entries: list[str] = []
+    lines = str(text or "").splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        if line.strip().startswith("```"):
+            block = [line]
+            i += 1
+            while i < len(lines):
+                block.append(lines[i])
+                i += 1
+                if lines[i - 1].strip().startswith("```") and len(block) > 1:
+                    break
+            prev = entries[-1] if entries else ""
+            if prev and "```" not in prev and ": " not in prev and len(prev) <= 80:
+                entries[-1] = prev + "\n" + "\n".join(block)
+            else:
+                entries.append("\n".join(block))
+            continue
+        entries.append(line)
+        i += 1
+    return entries
+
+
 def _classify_unmarked_send(content: str) -> str:
-    """Classify a send that carries neither notify nor an interim marker."""
+    """Classify a send that carries neither notify nor an interim marker.
+
+    The gateway marks every turn-final reply notify=True, so an unmarked send
+    is never allowed to become a session-completing `response`.
+    """
     text = str(content or "").strip()
     if text == _generic_turn_error_text():
         return "error"
-    if text and "\n" not in text and len(text) <= _MAX_PROGRESS_LINE:
+    entries = _split_progress_entries(text)
+    if entries and all(len(entry) <= 2 * _MAX_PROGRESS_LINE for entry in entries):
         return "action"
-    return "response"
+    return "thought"
 
 
 def _parse_progress_line(line: str) -> tuple[str, str]:
-    """Split a gateway tool-progress line into Linear action/parameter fields."""
+    """Split one progress entry into Linear action/parameter fields."""
     text = line.strip()
+    if "```" in text:
+        head, _, rest = text.partition("```")
+        code = rest.rsplit("```", 1)[0].strip("\n")
+        parameter = " ⏎ ".join(part.strip() for part in code.splitlines() if part.strip())
+        return (head.strip() or "💻 terminal")[:120], parameter[:_MAX_PROGRESS_LINE]
     match = _PROGRESS_PREVIEW_RE.match(text)
     if match:
         action, parameter = match.group("head"), match.group("param")
@@ -742,6 +786,13 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # already posted as `action` activities). Linear activities are
         # immutable, so each gateway "edit" posts only the new lines.
         self._progress_bubbles: dict[str, tuple[str, int]] = {}
+        # Agent Session ID -> [turns dispatched but not yet answered, gateway
+        # session key]. A send that lands while no turn is open is Hermes
+        # speaking on its own (post-turn self-improvement review, background
+        # process notices) and must stay visible instead of being folded into
+        # the collapsed "worked for" block as a thought/action.
+        # Value: [open count, session key, monotonic time of last dispatch].
+        self._open_turns: dict[str, list[Any]] = {}
 
     def toolsets_for_source(self, source) -> list[str] | None:
         """Hard-filtered toolset list for every Linear-triggered turn.
@@ -944,6 +995,10 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # reserved for the real final response.
         if meta.get("is_approval_prompt"):
             return await self._send_activity(agent_session_id, content, "elicitation")
+        if not meta.get("notify") and not self._turn_open(agent_session_id):
+            # Between turns: a proactive message. Post it as a visible
+            # `response` without touching the source-thread mirror.
+            return await self._send_activity(agent_session_id, content, "response")
         if meta.get("_interim_send"):
             return await self._send_activity(agent_session_id, content, "thought")
         if not meta.get("notify"):
@@ -953,10 +1008,12 @@ class LinearAgentAdapter(BasePlatformAdapter):
             # session-completing `response`.
             kind = _classify_unmarked_send(content)
             if kind == "error":
+                self._close_turn(agent_session_id)
                 return await self._send_activity(agent_session_id, content, "error")
             if kind == "action":
                 bubble_id = f"progress:{uuid.uuid4().hex}"
-                return await self._post_progress_lines(agent_session_id, bubble_id, content.splitlines(), 0)
+                return await self._post_progress_lines(agent_session_id, bubble_id, _split_progress_entries(content), 0)
+            return await self._send_activity(agent_session_id, content, "thought")
 
         activity: dict[str, Any] = {}
         chunks = _split_message(content, self.MAX_MESSAGE_LENGTH)
@@ -968,6 +1025,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - adapter boundary returns SendResult
             logger.warning("[linear_agent] Failed to create response activity: %s", exc)
             return SendResult(success=False, error=str(exc))
+        self._close_turn(agent_session_id)
 
         source_reply: dict[str, Any] | None = None
         source_route = self._source_thread_routes.pop(agent_session_id, None)
@@ -1038,13 +1096,12 @@ class LinearAgentAdapter(BasePlatformAdapter):
         if bubble is None:
             return SendResult(success=False, error="Not supported")
         session_id, posted = bubble
-        lines = [line for line in content.splitlines() if line.strip()]
-        return await self._post_progress_lines(session_id, str(message_id), lines, posted)
+        return await self._post_progress_lines(session_id, str(message_id), _split_progress_entries(content), posted)
 
     async def _post_progress_lines(
         self, agent_session_id: str, bubble_id: str, lines: list[str], already_posted: int
     ) -> SendResult:
-        lines = [line for line in lines if line.strip()]
+        lines = [line for line in lines if line.strip()]  # entries (one per tool call)
         posted = already_posted
         if agent_session_id not in self._stopped_sessions:
             for line in lines[already_posted:]:
@@ -1059,6 +1116,43 @@ class LinearAgentAdapter(BasePlatformAdapter):
             self._progress_bubbles.clear()
         self._progress_bubbles[bubble_id] = (agent_session_id, max(posted, len(lines)))
         return SendResult(success=True, message_id=bubble_id)
+
+    # A just-dispatched turn may sit in the gateway's text debounce before it
+    # shows up in _active_sessions; don't call it idle during that window.
+    TURN_REGISTRATION_GRACE = 30.0
+
+    def _open_turn(self, agent_session_id: str, session_key: str) -> None:
+        if agent_session_id not in self._open_turns and len(self._open_turns) >= 256:
+            self._open_turns.clear()
+        entry = self._open_turns.setdefault(agent_session_id, [0, session_key, 0.0])
+        entry[0] += 1
+        entry[1] = session_key
+        entry[2] = time.monotonic()
+
+    def _close_turn(self, agent_session_id: str) -> None:
+        entry = self._open_turns.get(agent_session_id)
+        if entry is None:
+            return
+        entry[0] -= 1
+        if entry[0] <= 0:
+            self._open_turns.pop(agent_session_id, None)
+
+    def _turn_open(self, agent_session_id: str) -> bool:
+        """True while a dispatched Linear turn for this session awaits its final reply.
+
+        Merged or interrupted turns can leave the count high; the gateway's
+        own guard is the tiebreaker, so a stale count self-heals once the
+        session is no longer running or queued.
+        """
+        entry = self._open_turns.get(agent_session_id)
+        if entry is None:
+            return False
+        key, opened_at = entry[1], entry[2]
+        settled = time.monotonic() - opened_at > self.TURN_REGISTRATION_GRACE
+        if settled and key and key not in self._active_sessions and key not in self._pending_messages:
+            self._open_turns.pop(agent_session_id, None)
+            return False
+        return True
 
     def warning_notifications_enabled(self, logical_platform=None, *, chat_id=None, metadata=None) -> bool:
         """Never show diagnostic variants (raw exception text) in Linear; details stay in logs."""
@@ -1676,6 +1770,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         self._typing_marks.pop(session_id, None)
         # Drop the pending source-thread mirror; nothing else may be written.
         self._source_thread_routes.pop(session_id, None)
+        self._open_turns.pop(session_id, None)
         already_stopped = session_id in self._stopped_sessions
         if len(self._stopped_sessions) >= 256:
             self._stopped_sessions.clear()
@@ -1729,6 +1824,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # The linear_agent toolset reaches sessions through the gateway's
         # platform-toolset resolution (plugin platforms default to their own
         # registered toolset), not through the event object.
+        self._open_turn(context.agent_session_id, self._source_session_key(source))
         await self.handle_message(event)
 
 
