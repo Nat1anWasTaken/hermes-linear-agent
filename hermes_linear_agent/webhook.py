@@ -408,6 +408,25 @@ def extract_context(
     # against payload-shape drift.
     signal = _string(agent_activity.get("signal") or payload.get("signal")).lower()
 
+    # Who is driving this delivery. Linear's AgentSessionEventWebhookPayload
+    # carries no top-level `actor`: a new session names its human in
+    # agentSession.creator / creatorId, a follow-up names its author in
+    # agentActivity.user / userId. Follow-ups are authorized by the ACTIVITY
+    # author only, never the session creator — otherwise anyone replying in a
+    # session an allowlisted user started would inherit that user's grant.
+    activity_user = agent_activity.get("user") if isinstance(agent_activity.get("user"), dict) else {}
+    creator = session.get("creator") if isinstance(session.get("creator"), dict) else {}
+    if action == "prompted":
+        actor_id = (
+            actor.get("id") or activity_actor.get("id") or activity_user.get("id") or agent_activity.get("userId")
+        )
+        actor_name = actor.get("name") or activity_actor.get("name") or activity_user.get("name")
+    else:
+        actor_id = actor.get("id") or creator.get("id") or session.get("creatorId")
+        actor_name = actor.get("name") or creator.get("name")
+    actor_id = actor_id or payload.get("actorUserId") or _get_path(payload, "user", "id")
+    actor_name = actor_name or _get_path(payload, "user", "name")
+
     return LinearWebhookContext(
         action=action,
         delivery_id=extract_delivery_id(payload, headers),
@@ -422,13 +441,8 @@ def extract_context(
         issue_identifier=_string(issue.get("identifier")),
         issue_title=_string(issue.get("title")),
         comment_id=_string(comment.get("id")),
-        actor_user_id=_string(
-            actor.get("id")
-            or activity_actor.get("id")
-            or payload.get("actorUserId")
-            or _get_path(payload, "user", "id")
-        ),
-        actor_user_name=_string(actor.get("name") or activity_actor.get("name") or _get_path(payload, "user", "name")),
+        actor_user_id=_string(actor_id),
+        actor_user_name=_string(actor_name),
         team_id=_string(team.get("id") or payload.get("teamId")),
         prompt_context=_string(payload.get("promptContext") or session.get("promptContext")),
         guidance=_guidance_text(payload.get("guidance") or session.get("guidance")),
@@ -441,6 +455,23 @@ def extract_context(
             or _get_path(payload, "agentActivity", "sourceCommentId")
         ),
     )
+
+
+_ACTOR_PATHS = (
+    ("actor", "id"),
+    ("agentSession", "creator", "id"),
+    ("agentSession", "creatorId"),
+    ("agentActivity", "user", "id"),
+    ("agentActivity", "userId"),
+    ("agentActivity", "actor", "id"),
+    ("actorUserId",),
+    ("user", "id"),
+)
+
+
+def describe_actor_fields(payload: Mapping[str, Any]) -> list[str]:
+    """Which actor-bearing paths a payload carries — names only, never values."""
+    return [".".join(path) for path in _ACTOR_PATHS if _string(_get_path(payload, *path))]
 
 
 def is_authorized(

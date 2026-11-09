@@ -55,6 +55,7 @@ from .webhook import (
     build_created_prompt,
     build_prompted_message,
     build_update_prompt,
+    describe_actor_fields,
     describe_signature_headers,
     extract_context,
     is_authorized,
@@ -1142,9 +1143,11 @@ class LinearAgentAdapter(BasePlatformAdapter):
 
         if not self._webhook_sender_authorized(context):
             logger.warning(
-                "[linear_agent] Rejected webhook for unauthorized user/team user=%s team=%s",
+                "[linear_agent] Rejected webhook for unauthorized user/team user=%s team=%s action=%s actor_fields=%s",
                 context.actor_user_id,
                 context.team_id,
+                context.action,
+                describe_actor_fields(payload),
             )
             return {"error": "Unauthorized Linear user or team"}, 403
 

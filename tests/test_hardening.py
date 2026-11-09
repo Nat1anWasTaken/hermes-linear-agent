@@ -27,6 +27,7 @@ from hermes_linear_agent.registry import set_active_adapter
 from hermes_linear_agent.webhook import (
     build_created_prompt,
     build_prompted_message,
+    describe_actor_fields,
     extract_context,
 )
 
@@ -531,3 +532,74 @@ async def test_replayed_delivery_is_deduplicated_and_stale_is_rejected():
     resp, status = await adapter.handle_webhook(_headers(old, "evt-old"), old)
     assert status == 400 and "Stale" in resp["error"]
     assert len(dispatched) == 1
+
+
+# ── Actor extraction for Linear's real AgentSessionEvent shape (live finding) ──
+
+
+def _sdk_created(creator="user-1"):
+    """AgentSessionEventWebhookPayload shape: no top-level actor."""
+    return {
+        "type": "AgentSessionEvent",
+        "action": "created",
+        "organizationId": "ws-1",
+        "appUserId": "app-1",
+        "agentSession": {
+            "id": "session-9",
+            "creatorId": creator,
+            "creator": {"id": creator, "name": "Nathan"},
+            "issue": {"id": "issue-1", "identifier": "NAT-1", "title": "T", "team": {"id": "team-1"}},
+        },
+        "promptContext": "<issue>…</issue>",
+    }
+
+
+def _sdk_prompted(creator="user-1", author="user-1"):
+    payload = _sdk_created(creator)
+    payload["action"] = "prompted"
+    payload["agentActivity"] = {
+        "id": "act-9",
+        "agentSessionId": "session-9",
+        "userId": author,
+        "user": {"id": author, "name": "Someone"},
+        "content": {"type": "prompt", "body": "follow up"},
+    }
+    return payload
+
+
+def test_created_actor_comes_from_session_creator():
+    ctx = extract_context(_sdk_created(), {"Linear-Delivery-Id": "d1"})
+    assert ctx.actor_user_id == "user-1" and ctx.actor_user_name == "Nathan"
+    assert ctx.workspace_id == "ws-1"
+
+
+def test_prompted_actor_is_activity_author_not_session_creator():
+    ctx = extract_context(_sdk_prompted(creator="user-1", author="intruder"), {"Linear-Delivery-Id": "d2"})
+    assert ctx.actor_user_id == "intruder"
+
+
+@pytest.mark.asyncio
+async def test_sdk_shaped_webhooks_authorize_correctly():
+    client = _Client()
+    adapter = _adapter(extra={"allow_all_users": False, "allowed_users": ["user-1"]}, client=client)
+    dispatched = []
+
+    async def capture(event):
+        dispatched.append(event)
+
+    adapter.handle_message = capture
+    for delivery, payload, expected in (
+        ("sdk-c", _sdk_created(), 200),
+        ("sdk-p-ok", _sdk_prompted(author="user-1"), 200),
+        ("sdk-p-bad", _sdk_prompted(creator="user-1", author="intruder"), 403),
+    ):
+        raw = _raw(payload)
+        _, status = await adapter.handle_webhook(_headers(raw, delivery), raw)
+        assert status == expected, delivery
+    assert len(dispatched) == 2
+
+
+def test_describe_actor_fields_never_includes_values():
+    fields = describe_actor_fields(_sdk_prompted(author="secret-user"))
+    assert "agentActivity.userId" in fields and "agentSession.creatorId" in fields
+    assert not any("secret-user" in f for f in fields)
