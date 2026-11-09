@@ -1596,7 +1596,7 @@ async def test_adapter_send_uses_response_activity():
     fake_client = _FakeLinearClient()
     adapter = _make_adapter(client=fake_client)
 
-    result = await adapter.send("session-1", "Final answer")
+    result = await adapter.send("session-1", "Final answer", metadata={"notify": True})
 
     assert result.success is True
     assert result.message_id == "response-1"
@@ -1799,7 +1799,7 @@ async def test_send_chunks_oversized_responses():
     paragraphs = "\n\n".join(f"paragraph {i} " + "x" * 90 for i in range(600))
     assert len(paragraphs) > adapter.MAX_MESSAGE_LENGTH
 
-    result = await adapter.send("session-1", paragraphs, metadata={})
+    result = await adapter.send("session-1", paragraphs, metadata={"notify": True})
 
     assert result.success is True
     responses = [c for c in fake_client.calls if c[0] == "response"]
@@ -1967,7 +1967,7 @@ async def test_reply_in_source_thread_is_mirrored_to_resolved_root_by_adapter():
     assert len(dispatched) == 1
     assert "Reply in the source thread" not in dispatched[0].text
 
-    result = await adapter.send("session-1", "Final answer")
+    result = await adapter.send("session-1", "Final answer", metadata={"notify": True})
 
     assert result.success is True
     assert client.calls == [

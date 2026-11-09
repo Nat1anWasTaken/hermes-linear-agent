@@ -349,6 +349,42 @@ def filter_linear_toolsets(requested: Any, *, allow_mcp: bool = False, unrestric
     return kept
 
 
+_PROGRESS_PREVIEW_RE = re.compile(r'^(?P<head>.+?): "(?P<param>.*)"$', re.DOTALL)
+_MAX_PROGRESS_LINE = 300
+
+
+def _generic_turn_error_text() -> str:
+    try:
+        from gateway.platforms import base as _base
+
+        return str(_base.t("gateway.notify.turn_error")).strip()
+    except Exception:  # noqa: BLE001 - i18n unavailable: fall back to English
+        return "Sorry, I encountered an error."
+
+
+def _classify_unmarked_send(content: str) -> str:
+    """Classify a send that carries neither notify nor an interim marker."""
+    text = str(content or "").strip()
+    if text == _generic_turn_error_text():
+        return "error"
+    if text and "\n" not in text and len(text) <= _MAX_PROGRESS_LINE:
+        return "action"
+    return "response"
+
+
+def _parse_progress_line(line: str) -> tuple[str, str]:
+    """Split a gateway tool-progress line into Linear action/parameter fields."""
+    text = line.strip()
+    match = _PROGRESS_PREVIEW_RE.match(text)
+    if match:
+        action, parameter = match.group("head"), match.group("param")
+    elif ": " in text:
+        action, parameter = text.split(": ", 1)
+    else:
+        action, parameter = text, ""
+    return action.strip()[:120], parameter.strip()[:_MAX_PROGRESS_LINE]
+
+
 def _normalize_path(value: Any, default: str = DEFAULT_WEBHOOK_PATH) -> str:
     path = str(value or default).strip() or default
     if not path.startswith("/"):
@@ -702,6 +738,10 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # confirming activity; any late output from the interrupted turn is
         # dropped until the human prompts the session again.
         self._stopped_sessions: dict[str, float] = {}
+        # Tool-progress bubbles: synthetic message id -> (session id, lines
+        # already posted as `action` activities). Linear activities are
+        # immutable, so each gateway "edit" posts only the new lines.
+        self._progress_bubbles: dict[str, tuple[str, int]] = {}
 
     def toolsets_for_source(self, source) -> list[str] | None:
         """Hard-filtered toolset list for every Linear-triggered turn.
@@ -906,6 +946,17 @@ class LinearAgentAdapter(BasePlatformAdapter):
             return await self._send_activity(agent_session_id, content, "elicitation")
         if meta.get("_interim_send"):
             return await self._send_activity(agent_session_id, content, "thought")
+        if not meta.get("notify"):
+            # The gateway marks every turn-final reply notify=True. Unmarked
+            # sends are its progress lane (tool lines, which carry no interim
+            # marker in v0.23) or the turn-error notice; neither may become a
+            # session-completing `response`.
+            kind = _classify_unmarked_send(content)
+            if kind == "error":
+                return await self._send_activity(agent_session_id, content, "error")
+            if kind == "action":
+                bubble_id = f"progress:{uuid.uuid4().hex}"
+                return await self._post_progress_lines(agent_session_id, bubble_id, content.splitlines(), 0)
 
         activity: dict[str, Any] = {}
         chunks = _split_message(content, self.MAX_MESSAGE_LENGTH)
@@ -968,6 +1019,50 @@ class LinearAgentAdapter(BasePlatformAdapter):
         if agent_session_id in self._stopped_sessions:
             return SendResult(success=True, message_id="")
         return await self._send_activity(agent_session_id, content, "thought")
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Gateway progress-bubble "edits" become new `action` activities.
+
+        Implementing this is what makes the gateway's tool-progress lane run
+        for Linear at all; only lines not yet posted for this bubble are sent.
+        """
+        bubble = self._progress_bubbles.get(str(message_id))
+        if bubble is None:
+            return SendResult(success=False, error="Not supported")
+        session_id, posted = bubble
+        lines = [line for line in content.splitlines() if line.strip()]
+        return await self._post_progress_lines(session_id, str(message_id), lines, posted)
+
+    async def _post_progress_lines(
+        self, agent_session_id: str, bubble_id: str, lines: list[str], already_posted: int
+    ) -> SendResult:
+        lines = [line for line in lines if line.strip()]
+        posted = already_posted
+        if agent_session_id not in self._stopped_sessions:
+            for line in lines[already_posted:]:
+                action, parameter = _parse_progress_line(line)
+                try:
+                    await self._client.create_action(agent_session_id, action, parameter)
+                except Exception as exc:  # noqa: BLE001 - progress is best-effort
+                    logger.debug("[linear_agent] Tool-progress action failed: %s", exc)
+                    break
+                posted += 1
+        if len(self._progress_bubbles) >= 256:
+            self._progress_bubbles.clear()
+        self._progress_bubbles[bubble_id] = (agent_session_id, max(posted, len(lines)))
+        return SendResult(success=True, message_id=bubble_id)
+
+    def warning_notifications_enabled(self, logical_platform=None, *, chat_id=None, metadata=None) -> bool:
+        """Never show diagnostic variants (raw exception text) in Linear; details stay in logs."""
+        return False
 
     async def _send_activity(self, agent_session_id: str, content: str, response_type: str) -> SendResult:
         """Post non-final content as ``thought``/``elicitation`` activities."""
