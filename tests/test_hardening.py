@@ -32,6 +32,8 @@ from hermes_linear_agent.webhook import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+# Every turn-final reply from the gateway carries notify=True.
+FINAL = {"notify": True}
 SECRET = "secret"
 
 
@@ -50,6 +52,10 @@ class _Client:
     async def create_error(self, sid, body):
         self.calls.append(("error", sid, body))
         return {"id": "e"}
+
+    async def create_action(self, sid, action, parameter="", result=None):
+        self.calls.append(("action", sid, action, parameter))
+        return {"id": "a"}
 
     async def create_comment(self, issue_id, body, *, parent_id=None, mutation_policy=None):
         self.calls.append(("comment", issue_id, body, parent_id))
@@ -170,7 +176,7 @@ async def test_stop_posts_exactly_one_confirmation_and_blocks_late_output():
         assert status == 200 and resp["status"] == "stopped"
 
     # The interrupted turn's late final answer must not be written.
-    late = await adapter.send("session-1", "late answer")
+    late = await adapter.send("session-1", "late answer", metadata=FINAL)
     assert late.success is True
     await adapter.send_typing("session-1")
     responses = [c for c in client.calls if c[0] == "response"]
@@ -187,7 +193,7 @@ async def test_stop_posts_exactly_one_confirmation_and_blocks_late_output():
     raw = _raw(_prompted(delivery="after-stop"))
     await adapter.handle_webhook(_headers(raw, "after-stop"), raw)
     assert dispatched
-    await adapter.send("session-1", "fresh answer")
+    await adapter.send("session-1", "fresh answer", metadata=FINAL)
     assert client.calls[-1] == ("response", "session-1", "fresh answer")
 
 
@@ -235,7 +241,7 @@ async def test_approval_prompt_is_elicitation_and_keeps_source_mirror():
     assert client.calls[-1] == ("thought", "session-1", "status update")
     assert "session-1" in adapter._source_thread_routes
 
-    await adapter.send("session-1", "Final answer")
+    await adapter.send("session-1", "Final answer", metadata=FINAL)
     assert ("response", "session-1", "Final answer") in client.calls
     assert ("comment", "issue-1", "Final answer", "root-1") in client.calls
     assert "session-1" not in adapter._source_thread_routes
@@ -718,3 +724,122 @@ async def test_signed_body_without_webhook_timestamp_is_rejected():
     raw = json.dumps(_created(delivery="evt-no-ts"), separators=(",", ":")).encode()
     resp, status = await adapter.handle_webhook({"Linear-Signature": _signed_hex(raw), "Linear-Delivery": "x"}, raw)
     assert status == 400 and "timestamp" in resp["error"].lower()
+
+
+# ── Tool progress → Linear `action` activities ──
+
+
+def test_gateway_progress_contracts():
+    """The adapter relies on these v0.23 gateway behaviors; fail loudly if they change."""
+    import inspect
+
+    from gateway.platforms import base
+
+    base_src = inspect.getsource(base)
+    assert "_final_thread_metadata = _mark_notify_metadata(_thread_metadata)" in base_src
+    assert base._mark_notify_metadata({})["notify"] is True
+    progress_src = (Path(base.__file__).parents[1] / "run_turn_progress.py").read_text()
+    # The progress lane only runs for adapters that override edit_message ...
+    assert "adapter_edit is BasePlatformAdapter.edit_message" in progress_src
+    # ... and its sends carry no interim/notify marker.
+    assert "content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata" in progress_src
+
+
+def test_adapter_overrides_edit_message_so_progress_lane_runs():
+    from gateway.platforms.base import BasePlatformAdapter
+
+    assert LinearAgentAdapter.edit_message is not BasePlatformAdapter.edit_message
+
+
+@pytest.mark.asyncio
+async def test_progress_lines_become_actions_and_edits_post_only_new_lines():
+    client = _Client()
+    adapter = _adapter(client=client)
+    first = await adapter.send("session-1", '🔍 web_search: "kiwi history"')
+    assert first.success and first.message_id.startswith("progress:")
+    await adapter.edit_message("session-1", first.message_id, '🔍 web_search: "kiwi history"\n🧠 memory: "recall"')
+    # Repeat-count edit rewrites the last line only: nothing new to post.
+    await adapter.edit_message("session-1", first.message_id, '🔍 web_search: "kiwi history"\n🧠 memory: "recall" (×2)')
+    assert client.calls == [
+        ("action", "session-1", "🔍 web_search", "kiwi history"),
+        ("action", "session-1", "🧠 memory", "recall"),
+    ]
+    assert not any(c[0] == "response" for c in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_progress_does_not_consume_source_mirror_or_complete_session():
+    client = _Client()
+    adapter = _adapter(
+        extra={"reply_in_source_thread": True, "mutation_policy": {"create_comments": True}}, client=client
+    )
+    adapter._source_thread_routes["session-1"] = ("issue-1", "root-1")
+    await adapter.send("session-1", "⚙️ linear_agent_get_issue...")
+    assert "session-1" in adapter._source_thread_routes
+    await adapter.send("session-1", "The answer.", metadata=FINAL)
+    assert ("response", "session-1", "The answer.") in client.calls
+    assert ("comment", "issue-1", "The answer.", "root-1") in client.calls
+
+
+@pytest.mark.asyncio
+async def test_unknown_bubble_edit_is_refused_and_stopped_sessions_get_no_actions():
+    client = _Client()
+    adapter = _adapter(client=client)
+    assert (await adapter.edit_message("session-1", "nope", "x")).success is False
+    adapter._stopped_sessions["session-1"] = 1.0
+    await adapter.send("session-1", '🔍 web_search: "x"')
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_unmarked_turn_error_becomes_error_activity_and_multiline_stays_response():
+    client = _Client()
+    adapter = _adapter(client=client)
+    await adapter.send("session-1", "Sorry, I encountered an error.")
+    await adapter.send("session-1", "line one\nline two")
+    assert client.calls == [
+        ("error", "session-1", "Sorry, I encountered an error."),
+        ("response", "session-1", "line one\nline two"),
+    ]
+
+
+def test_diagnostic_warning_variants_are_hidden_on_linear():
+    adapter = _adapter()
+    assert adapter.warning_text("Sorry (RuntimeError).\ntoken=abc", "Sorry, I encountered an error.") == (
+        "Sorry, I encountered an error."
+    )
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ('🔍 web_search: "kiwi history"', ("🔍 web_search", "kiwi history")),
+        ("⚙️ todo...", ("⚙️ todo...", "")),
+        ("🔍 Searching the web: kiwi", ("🔍 Searching the web", "kiwi")),
+    ],
+)
+def test_parse_progress_line(line, expected):
+    from hermes_linear_agent.adapter import _parse_progress_line
+
+    assert _parse_progress_line(line) == expected
+
+
+@pytest.mark.asyncio
+async def test_create_action_payload_shape():
+    from hermes_linear_agent.client import LinearGraphQLClient
+
+    class _Capture(LinearGraphQLClient):
+        def __init__(self):
+            super().__init__("token")
+            self.ops = []
+
+        async def _mutate(self, query, variables, **kw):
+            self.ops.append(variables)
+            return {"id": "act"}
+
+    client = _Capture()
+    await client.create_action("s-1", "🔍 web_search", "kiwi")
+    assert client.ops[0]["input"] == {
+        "agentSessionId": "s-1",
+        "content": {"type": "action", "action": "🔍 web_search", "parameter": "kiwi"},
+    }
