@@ -145,11 +145,17 @@ linear_agent:
   profile_routes: false
   # Hardening fork: Linear turns get `no_mcp` unless this is true.
   allow_mcp: false
+  # DANGER, opt-in (env: LINEAR_AGENT_UNRESTRICTED_TOOLSETS): disable the hard
+  # toolset guard so your toolset list reaches Linear turns unfiltered
+  # (terminal, file, code_execution, delegation, hermes-* ...). Linear content
+  # is untrusted input and can steer those tools. linear_agent and no_mcp are
+  # still enforced; an unset list still means the safe defaults.
+  # unrestricted_toolsets: false
   # Hardening fork: optional toolset list for Linear turns (otherwise
   # platform_toolsets.linear_agent, else linear_agent/web/clarify/todo).
   # terminal, code_execution, file, delegation, cronjob, computer_use,
   # browser, kanban, connections, session_search and hermes-* composites
-  # are always stripped.
+  # are always stripped (unless unrestricted_toolsets is on).
   # toolsets: [linear_agent, web, clarify, todo, memory, skills]
   # Every write operation fails closed; enable only what you need.
   mutation_policy:
