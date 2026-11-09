@@ -786,6 +786,13 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # already posted as `action` activities). Linear activities are
         # immutable, so each gateway "edit" posts only the new lines.
         self._progress_bubbles: dict[str, tuple[str, int]] = {}
+        # Agent Session ID -> [turns dispatched but not yet answered, gateway
+        # session key]. A send that lands while no turn is open is Hermes
+        # speaking on its own (post-turn self-improvement review, background
+        # process notices) and must stay visible instead of being folded into
+        # the collapsed "worked for" block as a thought/action.
+        # Value: [open count, session key, monotonic time of last dispatch].
+        self._open_turns: dict[str, list[Any]] = {}
 
     def toolsets_for_source(self, source) -> list[str] | None:
         """Hard-filtered toolset list for every Linear-triggered turn.
@@ -988,6 +995,10 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # reserved for the real final response.
         if meta.get("is_approval_prompt"):
             return await self._send_activity(agent_session_id, content, "elicitation")
+        if not meta.get("notify") and not self._turn_open(agent_session_id):
+            # Between turns: a proactive message. Post it as a visible
+            # `response` without touching the source-thread mirror.
+            return await self._send_activity(agent_session_id, content, "response")
         if meta.get("_interim_send"):
             return await self._send_activity(agent_session_id, content, "thought")
         if not meta.get("notify"):
@@ -997,6 +1008,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
             # session-completing `response`.
             kind = _classify_unmarked_send(content)
             if kind == "error":
+                self._close_turn(agent_session_id)
                 return await self._send_activity(agent_session_id, content, "error")
             if kind == "action":
                 bubble_id = f"progress:{uuid.uuid4().hex}"
@@ -1013,6 +1025,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - adapter boundary returns SendResult
             logger.warning("[linear_agent] Failed to create response activity: %s", exc)
             return SendResult(success=False, error=str(exc))
+        self._close_turn(agent_session_id)
 
         source_reply: dict[str, Any] | None = None
         source_route = self._source_thread_routes.pop(agent_session_id, None)
@@ -1103,6 +1116,43 @@ class LinearAgentAdapter(BasePlatformAdapter):
             self._progress_bubbles.clear()
         self._progress_bubbles[bubble_id] = (agent_session_id, max(posted, len(lines)))
         return SendResult(success=True, message_id=bubble_id)
+
+    # A just-dispatched turn may sit in the gateway's text debounce before it
+    # shows up in _active_sessions; don't call it idle during that window.
+    TURN_REGISTRATION_GRACE = 30.0
+
+    def _open_turn(self, agent_session_id: str, session_key: str) -> None:
+        if agent_session_id not in self._open_turns and len(self._open_turns) >= 256:
+            self._open_turns.clear()
+        entry = self._open_turns.setdefault(agent_session_id, [0, session_key, 0.0])
+        entry[0] += 1
+        entry[1] = session_key
+        entry[2] = time.monotonic()
+
+    def _close_turn(self, agent_session_id: str) -> None:
+        entry = self._open_turns.get(agent_session_id)
+        if entry is None:
+            return
+        entry[0] -= 1
+        if entry[0] <= 0:
+            self._open_turns.pop(agent_session_id, None)
+
+    def _turn_open(self, agent_session_id: str) -> bool:
+        """True while a dispatched Linear turn for this session awaits its final reply.
+
+        Merged or interrupted turns can leave the count high; the gateway's
+        own guard is the tiebreaker, so a stale count self-heals once the
+        session is no longer running or queued.
+        """
+        entry = self._open_turns.get(agent_session_id)
+        if entry is None:
+            return False
+        key, opened_at = entry[1], entry[2]
+        settled = time.monotonic() - opened_at > self.TURN_REGISTRATION_GRACE
+        if settled and key and key not in self._active_sessions and key not in self._pending_messages:
+            self._open_turns.pop(agent_session_id, None)
+            return False
+        return True
 
     def warning_notifications_enabled(self, logical_platform=None, *, chat_id=None, metadata=None) -> bool:
         """Never show diagnostic variants (raw exception text) in Linear; details stay in logs."""
@@ -1720,6 +1770,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         self._typing_marks.pop(session_id, None)
         # Drop the pending source-thread mirror; nothing else may be written.
         self._source_thread_routes.pop(session_id, None)
+        self._open_turns.pop(session_id, None)
         already_stopped = session_id in self._stopped_sessions
         if len(self._stopped_sessions) >= 256:
             self._stopped_sessions.clear()
@@ -1773,6 +1824,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # The linear_agent toolset reaches sessions through the gateway's
         # platform-toolset resolution (plugin platforms default to their own
         # registered toolset), not through the event object.
+        self._open_turn(context.agent_session_id, self._source_session_key(source))
         await self.handle_message(event)
 
 
