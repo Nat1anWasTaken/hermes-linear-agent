@@ -11,6 +11,15 @@ from hermes_linear_agent.client import LinearApiError, LinearGraphQLClient
 from hermes_linear_agent.registry import set_active_adapter
 
 
+def _bind_linear_session(monkeypatch, session_id="session-1", platform="linear_agent"):
+    """Simulate the gateway's per-turn session context for a Linear turn.
+
+    get_session_env falls back to os.environ when the contextvar is unset.
+    """
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", platform)
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", session_id)
+
+
 class _FakeSaveClient(LinearGraphQLClient):
     """Minimal fake that records calls and returns predictable results."""
 
@@ -404,8 +413,10 @@ async def test_create_issue_resolves_state_name_using_team_id():
 
 
 @pytest.mark.asyncio
-async def test_set_session_links_normalizes_and_sends():
+async def test_set_session_links_normalizes_and_sends(monkeypatch):
     from hermes_linear_agent import tools as t
+
+    _bind_linear_session(monkeypatch)
 
     class _FakeLinksClient(LinearGraphQLClient):
         def __init__(self):
@@ -436,11 +447,13 @@ async def test_set_session_links_normalizes_and_sends():
         {"label": "https://dash.example.com", "url": "https://dash.example.com"},
     ]
 
-    missing = await t.linear_agent_set_session_links(links=["https://x.example"])
-    assert "missing agent_session_id" in missing
+    # Omitted id -> current session.
+    defaulted = await t.linear_agent_set_session_links(links=["https://x.example"])
+    assert "✅ Attached 1 link(s)" in defaulted
+    assert adapter._client.calls[-1][0] == "session-1"
 
-    empty = await t.linear_agent_set_session_links(agent_session_id="s", links=[{"label": "no url"}])
-    assert "provide links" in empty
+    empty = await t.linear_agent_set_session_links(agent_session_id="session-1", links=[{"label": "no url"}])
+    assert "provide http(s) links" in empty
 
 
 # ---------------------------------------------------------------------------
@@ -466,8 +479,10 @@ def _adapter_with_plan_client():
 
 
 @pytest.mark.asyncio
-async def test_update_plan_normalizes_strings_and_status_variants():
+async def test_update_plan_normalizes_strings_and_status_variants(monkeypatch):
     from hermes_linear_agent import tools as t
+
+    _bind_linear_session(monkeypatch)
 
     adapter = _adapter_with_plan_client()
     client = adapter._client
@@ -497,18 +512,22 @@ async def test_update_plan_normalizes_strings_and_status_variants():
 
 
 @pytest.mark.asyncio
-async def test_update_plan_accepts_session_id_and_id_aliases():
+async def test_update_plan_accepts_session_id_and_id_aliases(monkeypatch):
     from hermes_linear_agent import tools as t
 
+    _bind_linear_session(monkeypatch, "sess-a")
     adapter = _adapter_with_plan_client()
     await t.linear_agent_update_plan(session_id="sess-a", plan=["step"])
-    await t.linear_agent_update_plan(id="sess-b", plan=["step"])
-    assert [c[0] for c in adapter._client.calls] == ["sess-a", "sess-b"]
+    await t.linear_agent_update_plan(id="sess-a", plan=["step"])
+    await t.linear_agent_update_plan(plan=["step"])  # omitted -> current session
+    assert [c[0] for c in adapter._client.calls] == ["sess-a", "sess-a", "sess-a"]
 
 
 @pytest.mark.asyncio
-async def test_update_plan_rejects_unknown_status():
+async def test_update_plan_rejects_unknown_status(monkeypatch):
     from hermes_linear_agent import tools as t
+
+    _bind_linear_session(monkeypatch)
 
     adapter = _adapter_with_plan_client()
     result = await t.linear_agent_update_plan(
@@ -522,13 +541,17 @@ async def test_update_plan_rejects_unknown_status():
 
 
 @pytest.mark.asyncio
-async def test_update_plan_requires_session_id_and_plan():
+async def test_update_plan_requires_linear_session_and_plan(monkeypatch):
     from hermes_linear_agent import tools as t
 
     adapter = _adapter_with_plan_client()
 
-    missing_id = await t.linear_agent_update_plan(plan=["step"])
-    assert "missing agent_session_id" in missing_id
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    outside = await t.linear_agent_update_plan(agent_session_id="session-1", plan=["step"])
+    assert "only available inside a Linear Agent Session" in outside
+
+    _bind_linear_session(monkeypatch)
 
     missing_plan = await t.linear_agent_update_plan(agent_session_id="session-1")
     assert "missing plan" in missing_plan

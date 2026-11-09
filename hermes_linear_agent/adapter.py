@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -51,13 +53,14 @@ from .webhook import (
     SUPPORTED_ACTIONS,
     LinearWebhookContext,
     LinearWebhookError,
+    body_timestamp_problem,
     build_created_prompt,
     build_prompted_message,
     build_update_prompt,
+    describe_actor_fields,
     describe_signature_headers,
     extract_context,
     is_authorized,
-    is_stale_body_timestamp,
     normalize_action,
     parse_json_body,
     verify_linear_signature,
@@ -99,6 +102,56 @@ DEFAULT_MUTATION_POLICY = {
 }
 _DEDUP_TTL_SECONDS = 3600
 MAX_MESSAGE_LENGTH = 40_000
+
+# Runtime OAuth scopes. Agent Sessions only reach the app when it holds the
+# app:assignable (delegation) and app:mentionable (@mention) scopes, so these
+# are always requested — even when an operator overrides the scope list.
+DEFAULT_RUNTIME_SCOPES = "read,write,app:assignable,app:mentionable"
+REQUIRED_AGENT_SCOPES = ("app:assignable", "app:mentionable")
+
+# Generic text posted to Linear when dispatch fails; details stay in local logs.
+GENERIC_ERROR_BODY = (
+    "Sorry — something went wrong while processing this request. "
+    "The operator can find details in the Hermes gateway logs (reference: {ref})."
+)
+
+# Toolsets a Linear-triggered turn must never receive, whatever the
+# operator's platform_toolsets says. Linear content is untrusted input and
+# the agent runs in the same container as every credential, so shell / code
+# execution / file writes / spawning unattended work are hard-denied here.
+DENIED_TOOLSETS = frozenset(
+    {
+        "terminal",
+        "code_execution",
+        "file",
+        "delegation",
+        "cronjob",
+        "computer_use",
+        "browser",
+        "kanban",
+        "connections",
+        "session_search",
+    }
+)
+# Tool-level backstop: any toolset (including custom/composite ones) that
+# resolves to one of these tools is dropped as well.
+DENIED_TOOLS = frozenset(
+    {
+        "terminal",
+        "process_manage",
+        "execute_code",
+        "write_file",
+        "patch",
+        "delegate_task",
+        "cronjob_manage",
+        "computer_use",
+        "browser_exec",
+        "browser_cdp",
+        "manage_connections",
+        "session_search",
+    }
+)
+SAFE_DEFAULT_TOOLSETS = ("linear_agent", "web", "clarify", "todo")
 
 
 def _str_env(name: str) -> str:
@@ -194,8 +247,11 @@ def _build_oauth_manager(extra: dict[str, Any], access_token: str) -> LinearOAut
     token_url = str(
         extra.get("token_url") or _str_env("LINEAR_AGENT_TOKEN_URL") or auth_state.get("token_url") or LINEAR_TOKEN_URL
     )
-    oauth_scopes = str(
-        extra.get("oauth_scopes") or _str_env("LINEAR_AGENT_OAUTH_SCOPES") or auth_state.get("scope") or "read,write"
+    oauth_scopes = _ensure_agent_scopes(
+        extra.get("oauth_scopes")
+        or _str_env("LINEAR_AGENT_OAUTH_SCOPES")
+        or auth_state.get("scope")
+        or DEFAULT_RUNTIME_SCOPES
     )
     persist_tokens = _bool_opt(extra, "persist_tokens", "LINEAR_AGENT_PERSIST_TOKENS", True)
     if persist_tokens:
@@ -219,6 +275,71 @@ def _build_oauth_manager(extra: dict[str, Any], access_token: str) -> LinearOAut
             persist_callback=callback,
         )
     )
+
+
+def _ensure_agent_scopes(value: Any) -> str:
+    """Return a comma-separated scope list that always includes the agent scopes.
+
+    Accepts comma- or space-separated strings (Linear echoes ``scope`` back
+    space-separated in some token responses) and lists. Order is preserved
+    and duplicates are dropped.
+    """
+    if isinstance(value, list | tuple | set):
+        items = [str(item).strip() for item in value]
+    else:
+        items = re.split(r"[,\s]+", str(value or ""))
+    scopes = [item for item in dict.fromkeys(item.strip() for item in items) if item]
+    if not scopes:
+        scopes = DEFAULT_RUNTIME_SCOPES.split(",")
+    for required in REQUIRED_AGENT_SCOPES:
+        if required not in scopes:
+            scopes.append(required)
+    return ",".join(scopes)
+
+
+def _toolset_tools(name: str) -> set[str]:
+    try:
+        from toolsets import resolve_toolset
+
+        return set(resolve_toolset(name))
+    except Exception:  # noqa: BLE001 - unknown toolset: name-level checks still apply
+        return set()
+
+
+def filter_linear_toolsets(requested: Any, *, allow_mcp: bool = False) -> list[str]:
+    """Strip dangerous toolsets from a Linear platform toolset list (fail closed).
+
+    ``requested`` is the operator's ``platform_toolsets.linear_agent`` value
+    (or None when unset). Composite ``hermes-*`` toolsets and anything in
+    DENIED_TOOLSETS — or resolving to a DENIED_TOOLS tool — are removed.
+    Unless ``allow_mcp`` is set, ``no_mcp`` is appended so globally enabled
+    MCP servers (which may act as the human user) never reach Linear turns.
+    """
+    if isinstance(requested, str):
+        names = [item.strip() for item in requested.split(",") if item.strip()]
+    elif isinstance(requested, list | tuple | set):
+        names = [str(item).strip() for item in requested if str(item).strip()]
+    else:
+        names = list(SAFE_DEFAULT_TOOLSETS)
+    kept: list[str] = []
+    dropped: list[str] = []
+    for name in dict.fromkeys(names):
+        if name == "no_mcp":
+            continue
+        if name.startswith("hermes-") or name in DENIED_TOOLSETS or (_toolset_tools(name) & DENIED_TOOLS):
+            dropped.append(name)
+            continue
+        kept.append(name)
+    if "linear_agent" not in kept:
+        kept.insert(0, "linear_agent")
+    if not allow_mcp:
+        kept.append("no_mcp")
+    if dropped:
+        logger.warning(
+            "[linear_agent] Refusing dangerous toolsets for Linear sessions: %s",
+            ", ".join(dropped),
+        )
+    return kept
 
 
 def _normalize_path(value: Any, default: str = DEFAULT_WEBHOOK_PATH) -> str:
@@ -373,6 +494,9 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict[str, Any] | N
         "env_path",
         "auth_path",
         "max_body_bytes",
+        "profile_routes",
+        "allow_mcp",
+        "toolsets",
     ):
         if key in platform_cfg:
             seed[key] = platform_cfg[key]
@@ -441,14 +565,33 @@ class LinearAgentAdapter(BasePlatformAdapter):
     ) -> None:
         super().__init__(config=config, platform=Platform("linear_agent"))
         extra = config.extra or {}
-        self._host = str(extra.get("webhook_host") or extra.get("host") or DEFAULT_HOST)
+        # Bind settings: YAML (webhook_host/host, webhook_port/port,
+        # webhook_path) wins, then LINEAR_AGENT_WEBHOOK_HOST/PORT/PATH env,
+        # then the defaults. Inside a container the host must stay 0.0.0.0
+        # so a reverse proxy on the Docker network can reach it.
+        self._host = str(
+            extra.get("webhook_host") or extra.get("host") or _str_env("LINEAR_AGENT_WEBHOOK_HOST") or DEFAULT_HOST
+        )
         # None-checked (not `or`-chained): an explicit 0 means "bind an
         # ephemeral port" and must not collapse into the default.
         port_val = extra.get("webhook_port")
         if port_val in (None, ""):
             port_val = extra.get("port")
+        if port_val in (None, ""):
+            port_val = _str_env("LINEAR_AGENT_WEBHOOK_PORT") or None
         self._port = DEFAULT_PORT if port_val in (None, "") else int(port_val)
-        self._webhook_path = _normalize_path(extra.get("webhook_path"))
+        if not 0 <= self._port <= 65535:
+            raise ValueError(f"linear_agent webhook port out of range: {self._port}")
+        self._webhook_path = _normalize_path(extra.get("webhook_path") or _str_env("LINEAR_AGENT_WEBHOOK_PATH"))
+        # Optional /p/<profile><webhook_path> routes. Off by default: the
+        # signature covers only the body, so the URL path must not be able to
+        # re-route a delivery into another profile.
+        self._profile_routes = _bool_opt(extra, "profile_routes", "LINEAR_AGENT_PROFILE_ROUTES", False)
+        # MCP servers are stripped from Linear turns unless explicitly allowed:
+        # they commonly authenticate as the human (e.g. a personal Linear or
+        # Telegram MCP), which would break app-only attribution.
+        self._allow_mcp = _bool_opt(extra, "allow_mcp", "LINEAR_AGENT_ALLOW_MCP", False)
+        self._configured_toolsets = extra.get("toolsets")
         self._access_token = _resolve_access_token(config.token, extra)
         self._webhook_secret = str(extra.get("webhook_secret") or _str_env("LINEAR_AGENT_WEBHOOK_SECRET") or "").strip()
         self._allow_unsigned_webhooks = _bool_opt(
@@ -511,6 +654,13 @@ class LinearAgentAdapter(BasePlatformAdapter):
             False,
         )
         self._mutation_policy = _merge_policy(extra.get("mutation_policy"))
+        # Gateway operational notices (e.g. "No home channel is set") reach
+        # adapters through a plain send() with no interim marker, which would
+        # post them as a session-completing `response`. Default this platform
+        # to private notice delivery so they route through send_private_notice
+        # below and land as non-final `thought` activities instead.
+        if isinstance(config.extra, dict):
+            config.extra.setdefault("notice_delivery", "private")
         self._auto_skills = _list_value(extra.get("auto_skills"))
         self._max_body_bytes = int(extra.get("max_body_bytes") or 1_048_576)
         self._oauth_manager = _build_oauth_manager(extra, self._access_token)
@@ -524,6 +674,29 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # Agent Session ID -> (issue ID, source thread root comment ID). Routes
         # are consumed exactly once by send(); bounded against abandoned runs.
         self._source_thread_routes: dict[str, tuple[str, str]] = {}
+        # Sessions a human stopped. Linear's stop contract allows exactly one
+        # confirming activity; any late output from the interrupted turn is
+        # dropped until the human prompts the session again.
+        self._stopped_sessions: dict[str, float] = {}
+
+    def toolsets_for_source(self, source) -> list[str] | None:
+        """Hard-filtered toolset list for every Linear-triggered turn.
+
+        Replaces ``platform_toolsets.linear_agent`` (the gateway re-validates
+        the result through its normal resolver). The operator's list is read
+        from ``linear_agent.toolsets`` or ``platform_toolsets.linear_agent``;
+        dangerous toolsets are removed regardless of what it says.
+        """
+        requested = self._configured_toolsets
+        if requested is None:
+            try:
+                from hermes_cli.config import load_config
+
+                requested = (load_config().get("platform_toolsets") or {}).get("linear_agent")
+            except Exception:  # noqa: BLE001 - fall back to the safe default list
+                logger.debug("[linear_agent] Could not read platform_toolsets", exc_info=True)
+                requested = None
+        return filter_linear_toolsets(requested, allow_mcp=self._allow_mcp)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not AIOHTTP_AVAILABLE:
@@ -556,7 +729,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
         app.router.add_post(self._webhook_path, self._handle_webhook)
-        app.router.add_post(f"/p/{{profile}}{self._webhook_path}", self._handle_webhook)
+        if self._profile_routes:
+            app.router.add_post(f"/p/{{profile}}{self._webhook_path}", self._handle_webhook)
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -612,8 +786,6 @@ class LinearAgentAdapter(BasePlatformAdapter):
         if client_id:
             return f"client:{client_id}"
         if self._access_token:
-            import hashlib
-
             return "token:" + hashlib.sha256(self._access_token.encode("utf-8")).hexdigest()[:16]
         return ""
 
@@ -679,12 +851,33 @@ class LinearAgentAdapter(BasePlatformAdapter):
         Real agent sessions get a ``response`` Agent Activity; synthetic
         issue-update sessions get a comment on the triggering issue.
         """
-        agent_session_id = str((metadata or {}).get("linear_agent_session_id") or chat_id or "").strip()
+        meta = metadata or {}
+        agent_session_id = str(meta.get("linear_agent_session_id") or chat_id or "").strip()
         if not agent_session_id:
             return SendResult(success=False, error="Missing Linear Agent Session ID")
+        if agent_session_id in self._stopped_sessions:
+            # Linear stop contract: no further writes after the confirmation.
+            logger.info(
+                "[linear_agent] Dropping output for stopped session %s",
+                agent_session_id,
+            )
+            return SendResult(success=True, message_id="")
         issue_id = self._issue_reply_target(agent_session_id)
         if issue_id:
             return await self._send_issue_comment(issue_id, content)
+
+        # Mid-turn sends are NOT the final answer. A `response` activity
+        # marks the Linear session complete, so:
+        #   * exec-approval prompts become `elicitation` (session shows
+        #     "awaiting input" while the command really is waiting), and
+        #   * other interim/status sends become `thought` activities.
+        # Neither consumes the one-shot source-thread mirror, which is
+        # reserved for the real final response.
+        if meta.get("is_approval_prompt"):
+            return await self._send_activity(agent_session_id, content, "elicitation")
+        if meta.get("_interim_send"):
+            return await self._send_activity(agent_session_id, content, "thought")
+
         activity: dict[str, Any] = {}
         chunks = _split_message(content, self.MAX_MESSAGE_LENGTH)
         try:
@@ -731,6 +924,33 @@ class LinearAgentAdapter(BasePlatformAdapter):
             raw_response={"agent_activity": activity, "source_comment": source_reply} if source_reply else activity,
         )
 
+    async def send_private_notice(
+        self,
+        chat_id: str,
+        user_id: str | None,
+        content: str,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Operational notices are never the turn's answer: post a `thought`."""
+        agent_session_id = str((metadata or {}).get("linear_agent_session_id") or chat_id or "").strip()
+        if not agent_session_id or self._issue_reply_target(agent_session_id):
+            return SendResult(success=False, error="No Linear Agent Session for a private notice")
+        if agent_session_id in self._stopped_sessions:
+            return SendResult(success=True, message_id="")
+        return await self._send_activity(agent_session_id, content, "thought")
+
+    async def _send_activity(self, agent_session_id: str, content: str, response_type: str) -> SendResult:
+        """Post non-final content as ``thought``/``elicitation`` activities."""
+        activity: dict[str, Any] = {}
+        try:
+            for chunk in _split_message(content, self.MAX_MESSAGE_LENGTH):
+                activity = await self._client.create_response(agent_session_id, chunk, response_type=response_type)
+        except Exception as exc:  # noqa: BLE001 - adapter boundary returns SendResult
+            logger.warning("[linear_agent] Failed to create %s activity: %s", response_type, exc)
+            return SendResult(success=False, error=str(exc))
+        return SendResult(success=True, message_id=str(activity.get("id") or ""), raw_response=activity)
+
     async def send_error_activity(self, agent_session_id: str, body: str) -> SendResult:
         issue_id = self._issue_reply_target(agent_session_id)
         if issue_id:
@@ -764,6 +984,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         clarify, exactly like the base text-fallback path.
         """
         agent_session_id = str((metadata or {}).get("linear_agent_session_id") or chat_id or "").strip()
+        if agent_session_id in self._stopped_sessions:
+            return SendResult(success=False, error="Linear session was stopped")
         if not agent_session_id or self._issue_reply_target(agent_session_id):
             # Synthetic issue-update sessions have no Linear session to
             # elicit in; fall back to the base text rendering (→ comment).
@@ -817,7 +1039,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         spam the session timeline.
         """
         session_id = str(chat_id or "").strip()
-        if not session_id or self._issue_reply_target(session_id):
+        if not session_id or self._issue_reply_target(session_id) or session_id in self._stopped_sessions:
             return
         now = time.time()
         if now - self._typing_marks.get(session_id, 0.0) < self.TYPING_THOUGHT_INTERVAL:
@@ -881,7 +1103,12 @@ class LinearAgentAdapter(BasePlatformAdapter):
         except LinearWebhookError as exc:
             return {"error": str(exc)}, 400
 
-        if is_stale_body_timestamp(payload, headers):
+        # Replay guard on the signed body only (headers are not signed).
+        ts_problem = body_timestamp_problem(payload)
+        if ts_problem == "missing":
+            logger.warning("[linear_agent] Rejecting webhook without a signed webhookTimestamp (replay guard)")
+            return {"error": "Missing webhook timestamp"}, 400
+        if ts_problem == "stale":
             logger.warning("[linear_agent] Rejecting stale webhook delivery (replay guard)")
             return {"error": "Stale webhook delivery"}, 400
 
@@ -943,13 +1170,21 @@ class LinearAgentAdapter(BasePlatformAdapter):
 
         if not self._webhook_sender_authorized(context):
             logger.warning(
-                "[linear_agent] Rejected webhook for unauthorized user/team user=%s team=%s",
+                "[linear_agent] Rejected webhook for unauthorized user/team user=%s team=%s action=%s actor_fields=%s",
                 context.actor_user_id,
                 context.team_id,
+                context.action,
+                describe_actor_fields(payload),
             )
             return {"error": "Unauthorized Linear user or team"}, 403
 
-        if self._dedup.is_duplicate(context.delivery_id):
+        # Dedupe on the signed body as well as the (unsigned, attacker-
+        # controllable) delivery-id header, so re-sending the same body under
+        # a new header value within the freshness window is still caught.
+        body_key = "body:" + hashlib.sha256(raw_body).hexdigest()
+        header_dup = self._dedup.is_duplicate(context.delivery_id)
+        body_dup = self._dedup.is_duplicate(body_key)
+        if header_dup or body_dup:
             return {
                 "status": "duplicate",
                 "delivery_id": context.delivery_id,
@@ -960,6 +1195,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # body as a prompt (Linear agent-signals contract).
         if context.action == "prompted" and context.signal == "stop":
             return await self._handle_stop_signal(context, profile=profile)
+        # Any other human activity re-opens a stopped session.
+        self._stopped_sessions.pop(context.agent_session_id, None)
 
         # Linear requires the webhook response within 5 seconds and an
         # acknowledging activity within 10 (else the session is marked
@@ -1009,12 +1246,17 @@ class LinearAgentAdapter(BasePlatformAdapter):
 
         try:
             await self._dispatch_linear_message(context, message, payload, profile=profile)
-        except Exception as exc:  # noqa: BLE001 - send an Agent Activity error when possible
-            logger.exception("[linear_agent] Dispatch failed for session %s", context.agent_session_id)
-            await self.send_error_activity(
+        except Exception:  # noqa: BLE001 - send an Agent Activity error when possible
+            # Raw exception text can carry internal paths, URLs or secrets, so
+            # Linear only gets a generic message plus a correlation id that
+            # matches this log line.
+            ref = uuid.uuid4().hex[:12]
+            logger.exception(
+                "[linear_agent] Dispatch failed for session %s (ref %s)",
                 context.agent_session_id,
-                f"The assistant failed to process this Linear Agent Session: {exc}",
+                ref,
             )
+            await self.send_error_activity(context.agent_session_id, GENERIC_ERROR_BODY.format(ref=ref))
             # 200: the delivery itself was handled (Linear retries non-200,
             # and repeated failures disable the webhook).
             return {"status": "error", "delivery_id": context.delivery_id}, 200
@@ -1055,6 +1297,15 @@ class LinearAgentAdapter(BasePlatformAdapter):
             logger.warning(
                 "[linear_agent] Source comment %s was not found for session %s",
                 context.source_comment_id,
+                context.agent_session_id,
+            )
+            return
+        if context.comment_id and root_id == context.comment_id:
+            # The source thread IS the session's own thread (e.g. delegation):
+            # Linear already mirrors responses there, so a second copy would
+            # duplicate every reply.
+            logger.debug(
+                "[linear_agent] Source thread is the session thread for %s; no mirror needed",
                 context.agent_session_id,
             )
             return
@@ -1260,18 +1511,14 @@ class LinearAgentAdapter(BasePlatformAdapter):
     def _session_key_for(self, context: LinearWebhookContext, *, profile: str | None = None) -> str:
         """Reconstruct the session key that handle_message uses for dispatch.
 
-        Mirrors BasePlatformAdapter.handle_message's build_session_key call
-        (same grouping flags, same source shape — including profile — as the
-        dispatch path) so the interrupt targets the same _active_sessions
-        entry the running turn holds.
+        Uses BasePlatformAdapter._source_session_key (what handle_message
+        files the running turn under) on the same source shape as dispatch,
+        so the interrupt targets the same _active_sessions entry.
         """
-        from gateway.session import build_session_key
-
-        return build_session_key(
-            self._build_source(context, profile=profile),
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        # Delegate to the base adapter's own key builder — the exact function
+        # handle_message uses — so profile namespacing and identity
+        # canonicalization can never drift from the dispatch path.
+        return self._source_session_key(self._build_source(context, profile=profile))
 
     async def _handle_stop_signal(
         self, context: LinearWebhookContext, *, profile: str | None = None
@@ -1303,6 +1550,19 @@ class LinearAgentAdapter(BasePlatformAdapter):
             )
         # Stop the typing heartbeat for this session.
         self._typing_marks.pop(session_id, None)
+        # Drop the pending source-thread mirror; nothing else may be written.
+        self._source_thread_routes.pop(session_id, None)
+        already_stopped = session_id in self._stopped_sessions
+        if len(self._stopped_sessions) >= 256:
+            self._stopped_sessions.clear()
+        self._stopped_sessions[session_id] = time.time()
+        if already_stopped:
+            # Repeated stop: the confirmation was already posted once.
+            return {
+                "status": "stopped",
+                "delivery_id": context.delivery_id,
+                "agent_session_id": session_id,
+            }, 200
         # Emit the single confirming final activity Linear requires on stop.
         try:
             await self._client.create_response(

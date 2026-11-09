@@ -20,7 +20,7 @@ def test_manifest_declares_external_platform_plugin():
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
     assert manifest["name"] == "linear-agent"
     assert manifest["kind"] == "platform"
-    assert manifest["version"] == "0.4.2"
+    assert manifest["version"] == "0.4.3"
     assert manifest["requires_env"] == []
 
 

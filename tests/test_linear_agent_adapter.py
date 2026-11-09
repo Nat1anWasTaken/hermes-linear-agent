@@ -206,6 +206,10 @@ class _ActiveMutationAdapter:
 
 
 def _body(payload):
+    # Real Linear deliveries always carry a signed webhookTimestamp (Unix ms);
+    # the adapter rejects bodies without one.
+    if isinstance(payload, dict) and "webhookTimestamp" not in payload:
+        payload = {**payload, "webhookTimestamp": int(time.time() * 1000)}
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
@@ -953,7 +957,10 @@ async def test_prompted_webhook_routes_followup_to_same_session():
     assert len(captured) == 1
     assert captured[0].source.chat_id == "session-1"
     assert captured[0].source.thread_id == "issue-1"
-    assert captured[0].text == "Can you check the test log too?"
+    # Follow-up text is delivered inside untrusted-content markers.
+    assert "<untrusted-linear-user-message>\nCan you check the test log too?\n</untrusted-linear-user-message>" in (
+        captured[0].text
+    )
 
 
 def _stop_prompted_payload(event_id="evt-stop"):
@@ -1086,11 +1093,11 @@ async def test_scoped_lock_acquired_on_connect_and_released_on_disconnect(monkey
         acquired.append((scope, identity))
         return True, None
 
-    def fake_release(scope, identity):
-        released.append((scope, identity))
-
     monkeypatch.setattr(status_mod, "acquire_scoped_lock", fake_acquire)
-    monkeypatch.setattr(status_mod, "release_scoped_lock", fake_release)
+    # v0.23 releases through BasePlatformAdapter._release_platform_lock (the
+    # module-level release_scoped_lock moved out of gateway.status), so spy on
+    # the adapter method and record the identity it is about to release.
+    _spy_release_platform_lock(monkeypatch, released)
 
     # Ephemeral port so the test never collides with a real gateway.
     adapter = _make_adapter(extra={"port": 0})
@@ -1135,11 +1142,21 @@ class _ViewerClient(_FakeLinearClient):
         return {"viewer": {"id": self._viewer_id}}
 
 
+def _spy_release_platform_lock(monkeypatch, released):
+    def fake_release(self):
+        identity = getattr(self, "_platform_lock_identity", None)
+        if identity:
+            released.append((self._platform_lock_scope, identity))
+        self._platform_lock_identity = None
+
+    monkeypatch.setattr(LinearAgentAdapter, "_release_platform_lock", fake_release)
+
+
 def _lock_free(monkeypatch):
     import gateway.status as status_mod
 
     monkeypatch.setattr(status_mod, "acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
-    monkeypatch.setattr(status_mod, "release_scoped_lock", lambda scope, identity: None)
+    _spy_release_platform_lock(monkeypatch, [])
 
 
 @pytest.mark.asyncio
@@ -1609,7 +1626,9 @@ async def test_dispatch_error_maps_to_error_activity():
     assert sorted(kinds) == ["error", "thought"]
     error_call = next(c for c in fake_client.calls if c[0] == "error")
     assert error_call[1] == "session-1"
-    assert "boom" in error_call[2]
+    # Raw exception text never reaches Linear; a correlation id does.
+    assert "boom" not in error_call[2]
+    assert "reference:" in error_call[2]
 
 
 @pytest.mark.asyncio

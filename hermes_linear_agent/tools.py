@@ -16,6 +16,7 @@ import json
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
+from urllib.parse import urlparse
 
 from .client import _UUID_RE
 from .registry import get_active_adapter
@@ -77,6 +78,46 @@ def _client_policy_appuser():
         adapter._mutation_policy,
         getattr(adapter, "_app_user_id", None),
     )
+
+
+def _current_linear_session_id() -> str:
+    """Agent Session id of the Linear turn this tool call belongs to, or "".
+
+    Read from the gateway's per-turn session context (``HERMES_SESSION_*``
+    contextvars), never from model-supplied arguments.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:  # noqa: BLE001 - outside a gateway there is no session
+        return ""
+    if get_session_env("HERMES_SESSION_PLATFORM", "") != "linear_agent":
+        return ""
+    session_id = str(get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    if not session_id or session_id.startswith("update:"):
+        # Synthetic issue-update sessions have no Linear Agent Session.
+        return ""
+    return session_id
+
+
+def _resolve_own_session(tool_name: str, kwargs: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Pin session-scoped tools to the CURRENT Linear Agent Session.
+
+    The model may omit the id (the current session is used) or repeat it;
+    any other id is refused so a prompt-injected call cannot edit the plan or
+    links of a different session.
+    """
+    current = _current_linear_session_id()
+    if not current:
+        return None, f"❌ {tool_name}: only available inside a Linear Agent Session"
+    requested = _first(kwargs, "agent_session_id", "session_id", "id")
+    if requested and str(requested).strip() != current:
+        return None, f"❌ {tool_name}: may only update the current Linear Agent Session ({current})"
+    return current, None
+
+
+def _safe_link_url(value: Any) -> str:
+    url = str(value or "").strip()
+    return url if urlparse(url).scheme in ("https", "http") and urlparse(url).netloc else ""
 
 
 def _looks_like_uuid(value: Any) -> bool:
@@ -944,21 +985,21 @@ async def linear_agent_set_session_links(*args, **kwargs) -> str:
     marked unresponsive during long work.
     """
     kwargs = _merge_tool_args(args, kwargs)
-    session_id = _first(kwargs, "agent_session_id", "session_id", "id")
+    session_id, error = _resolve_own_session("linear_agent_set_session_links", kwargs)
+    if error:
+        return error
     links = kwargs.get("links") or kwargs.get("urls")
-    if not session_id:
-        return "❌ linear_agent_set_session_links: missing agent_session_id (shown in your session prompt)"
     if isinstance(links, (str, dict)):
         links = [links]
     normalized = []
     for item in links or []:
-        if isinstance(item, str) and item.strip():
+        if isinstance(item, str) and _safe_link_url(item):
             normalized.append({"label": item.strip(), "url": item.strip()})
-        elif isinstance(item, dict) and str(item.get("url") or "").strip():
+        elif isinstance(item, dict) and _safe_link_url(item.get("url")):
             url = str(item["url"]).strip()
             normalized.append({"label": str(item.get("label") or url).strip(), "url": url})
     if not normalized:
-        return "❌ linear_agent_set_session_links: provide links as [{label, url}, ...] or a list of URLs"
+        return "❌ linear_agent_set_session_links: provide http(s) links as [{label, url}, ...] or a list of URLs"
 
     client, _ = _client_and_policy()
     try:
@@ -1007,10 +1048,10 @@ async def linear_agent_update_plan(*args, **kwargs) -> str:
     current status.
     """
     kwargs = _merge_tool_args(args, kwargs)
-    session_id = _first(kwargs, "agent_session_id", "session_id", "id")
+    session_id, error = _resolve_own_session("linear_agent_update_plan", kwargs)
+    if error:
+        return error
     plan = kwargs.get("plan")
-    if not session_id:
-        return "❌ linear_agent_update_plan: missing agent_session_id (shown in your session prompt)"
     if plan is None:
         return "❌ linear_agent_update_plan: missing plan (array of steps)"
     if isinstance(plan, (str, dict)):
@@ -1932,7 +1973,7 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             {
                 "agent_session_id": {
                     "type": "string",
-                    "description": "The agent session ID (shown in your session prompt)",
+                    "description": "Optional; defaults to the current session. Only the current Linear Agent Session is accepted.",
                 },
                 "links": {
                     "type": "array",
@@ -1940,7 +1981,7 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "items": {"type": ["object", "string"]},
                 },
             },
-            ["agent_session_id", "links"],
+            ["links"],
         ),
         "🔗",
     ),
@@ -1957,7 +1998,7 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             {
                 "agent_session_id": {
                     "type": "string",
-                    "description": "The agent session ID (shown in your session prompt). Also accepts session_id or id.",
+                    "description": "Optional; defaults to the current session. Only the current Linear Agent Session is accepted.",
                 },
                 "plan": {
                     "type": "array",
@@ -1969,7 +2010,7 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "items": {"type": ["object", "string"]},
                 },
             },
-            ["agent_session_id", "plan"],
+            ["plan"],
         ),
         "🗺️",
     ),
