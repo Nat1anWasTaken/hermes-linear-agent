@@ -1,6 +1,6 @@
 name: linear-agent
 label: Linear Agent
-version: 0.4.2
+version: 0.4.3
 description: Linear Agent Session platform and attributed Linear tools for Hermes Agent.
 author: Ritchie
 kind: platform

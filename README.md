@@ -93,6 +93,10 @@ LINEAR_AGENT_HOME_TARGET=
 LINEAR_AGENT_ALLOWED_USERS=
 LINEAR_AGENT_ALLOW_ALL_USERS=
 LINEAR_AGENT_AUTH_PATH=
+# Optional bind overrides (YAML webhook_host/webhook_port/webhook_path win)
+LINEAR_AGENT_WEBHOOK_HOST=
+LINEAR_AGENT_WEBHOOK_PORT=
+LINEAR_AGENT_WEBHOOK_PATH=
 ```
 
 Authorization is two-layer and **fail-closed at both layers**: the gateway grants access via `LINEAR_AGENT_ALLOWED_USERS` / `LINEAR_AGENT_ALLOW_ALL_USERS` (no allowlist means every user is denied), and the adapter checks the sender BEFORE any webhook side effect by consulting the gateway-registered authorization chain (the same one dispatch uses — env allowlists including the `*` wildcard, `GATEWAY_ALLOWED_USERS`, DM-pairing grants), with YAML `allowed_users` / `allow_all_users` granting as a union. With nothing configured anywhere, webhooks are rejected 403 and no ack/auto-start/stop activity ever fires. `allowed_teams` narrows further and never grants.
@@ -137,6 +141,16 @@ linear_agent:
   auto_skills: []
   # Webhook body size cap in bytes (default 1 MiB).
   max_body_bytes: 1048576
+  # Hardening fork: /p/<profile><webhook_path> routes are off unless enabled.
+  profile_routes: false
+  # Hardening fork: Linear turns get `no_mcp` unless this is true.
+  allow_mcp: false
+  # Hardening fork: optional toolset list for Linear turns (otherwise
+  # platform_toolsets.linear_agent, else linear_agent/web/clarify/todo).
+  # terminal, code_execution, file, delegation, cronjob, computer_use,
+  # browser, kanban, connections, session_search and hermes-* composites
+  # are always stripped.
+  # toolsets: [linear_agent, web, clarify, todo, memory, skills]
   # Every write operation fails closed; enable only what you need.
   mutation_policy:
     create_comments: false
