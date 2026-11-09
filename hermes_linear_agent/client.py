@@ -1286,6 +1286,26 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
             what="Agent activity",
         )
 
+    async def create_action(
+        self,
+        agent_session_id: str,
+        action: str,
+        parameter: str = "",
+        result: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an `action` agent activity (a tool invocation shown in Linear's timeline)."""
+        input_payload = build_activity_input(
+            agent_session_id, "action", action=action, parameter=parameter, result=result
+        )
+        return await self._mutate(
+            AGENT_ACTIVITY_CREATE_MUTATION,
+            {"input": input_payload},
+            op="agentActivityCreate",
+            entity="agentActivity",
+            policy_key=None,
+            what="Agent activity",
+        )
+
     async def create_thought(
         self,
         agent_session_id: str,
